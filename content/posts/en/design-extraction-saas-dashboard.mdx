@@ -1,0 +1,152 @@
+---
+title: "Building a SaaS Dashboard From a One-Page Design Spec: Lock the Rules Into the Theme, Reuse the Board Skeleton"
+description: "Given only a 33-line spec distilled from a board screenshot, Claude Code built a matching SaaS dashboard with Next.js and shadcn in about 70 minutes: rules locked into the theme, board skeleton reused, simulated data, scripted checks."
+published: "2026-09-29"
+locale: "en"
+tags:
+  - "AI"
+  - "Frontend"
+draft: false
+pinned: false
+translationKey: "design-extraction-saas-dashboard"
+---
+
+I gave Claude Code a 33-line design spec, the sizes, type, surface colors and layout rules distilled from a task-board screenshot, told it to read only that document, and asked for a SaaS dashboard in Next.js and shadcn. It never opened the original screenshot or the source project's code. About 70 minutes from scaffolding to commit, it shipped three pages (overview, customers, invoices), and I scored the result 10 out of 10. Four things did the work: the rules became numbers hard-wired into the theme, the board's skeleton carried over wholesale to the new domain, one internally consistent simulated dataset fed every number, and screenshots plus a click script checked it repeatedly. Where the spec was silent, the model's familiarity with this kind of product filled the gaps.
+
+![The finished overview: four key figures as chart switch tabs, three card columns below, and on the right the collapsed "ended this period" rows and the activity feed](/images/posts/design-extraction-saas-dashboard/overview.png)
+
+## The setup
+
+The spec comes from another experiment in the same repo, sonder-board, which recreated a task board from a screenshot. It runs 33 lines, and nearly everything in it is a number or a structure:
+
+- Skeleton: a window bar of about 38px; a fixed 240px navigation plus a workspace on the right; inside the workspace, a team/view bar of about 40px, a 40px filter bar and a scrollable board.
+- Board: three expanded status columns side by side, with finished statuses collapsed into a group of short rows on the right. Task cards have exactly three layers: ID and assignee; status and a title of at most two lines; priority and category labels.
+- Look: body 13/17, secondary 12/16, 8px gaps; surfaces from light gray to near-white to white; 1px low-contrast borders; 6px card radius, 5px control radius, 1.7px icon strokes; green for the team, yellow for in progress, purple for done, colored labels; mostly 400/500 weights, no big headings or stat cards.
+
+The spec notes that these values are estimates from the screenshot. It also lists what the screenshot did not show and had to be filled in: an edit dialog, search results, a filter menu, display settings, a mobile sidebar, plus feedback for an empty title on create and for a storage failure.
+
+My instruction was one sentence: use this spec, look at nothing else, create a subdirectory in the same repo, and build a SaaS dashboard UI with Next.js and shadcn. The source project's screenshot, its code and the DESIGN.md the spec links to were all out of bounds. There was no competitor research and no image generation either.
+
+The executor was Claude Code on Opus 5.5, in a single session with no cheap worker models. Following my global rules, it first proposed a plan, and the plan flagged one conflict: the spec forbids stat cards, but a dashboard needs its numbers up front. I told it to just build it and skip formatting, linting and unit tests.
+
+The final stack: Next.js 16.3.6 (App Router, static export), React 19.2, Tailwind CSS 4.3, shadcn 4.21 (Radix base, mira preset), Recharts 3.8 and zustand 5, with edits saved in the browser. The fictional business is Tessel, a company selling appointment-scheduling software to small shops; its back office tracks revenue, customers and invoices. The finished source is 96 files and 9,341 lines, of which the resized shadcn components account for 1,690.
+
+## Turn the rules into numbers and hard-wire them into the theme
+
+Before any page existed, every rule went into one theme file. There are four surface levels: `#F2F2F3` for the window bar and sidebar, `#FBFBFB` for the workspace, `#F4F4F5` for board columns and `#FFFFFF` for cards. The identification colors are just team green `#2F9E62`, in-progress yellow `#E5A50A` and done purple `#6E56CF`, plus a derived risk red `#E5484D`. Every value is marked "from the spec" or "derived" in the project's frontend design doc.
+
+The key step was redefining Tailwind's default scale directly:
+
+```css
+@theme {
+  --text-sm: 13px;
+  --text-sm--line-height: 17px;
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --font-weight-semibold: 500;
+  --font-weight-bold: 500;
+  --radius-md: 5px;
+  --radius-lg: 6px;
+}
+
+svg.lucide {
+  stroke-width: 1.7;
+}
+```
+
+shadcn's generated components are full of class names like `text-sm`, `font-semibold` and `rounded-lg`. Left alone, they arrive with 14px text, 600 weights and stock radii, and the page slides back to the default shadcn look. With the definitions changed, buttons, menus and dialogs comply without being touched one by one, and page code has a hard time breaking the rules.
+
+The mira preset already starts tight, with 28px buttons and 12px labels. A script resized the rest in bulk: menus, inputs and selects to 13px on desktop, and the dialog overlay from 80% black with blur to near-black at 22% opacity without blur. The icon library switched from the preset's default Hugeicons to lucide, and the rule above sets every icon stroke to 1.7.
+
+## Carry the board skeleton into the back office
+
+What makes two products look related is structure. Each structure in the spec got a counterpart in the new domain:
+
+| Structure in the spec                                                        | In the back office                                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Three expanded columns, finished ones collapsed into short rows on the right | The overview has three columns (revenue, trials, needs attention) and a right-hand "ended this period" column with conversions, expired trials, churned and refunded; the customer board collapses churned and expired trials by default, and invoices collapse paid, refunded and void |
+| Three-layer task card                                                        | Three-layer customer card: ID, monthly fee, owner; status glyph and a name of at most two lines; plan tier plus industry and risk labels. The plan tier borrows the three-bar priority icon                                                                                             |
+| Yellow for in progress, purple for done                                      | Trialing and dunning use a yellow half circle; paid and trial-converted use a solid purple check                                                                                                                                                                                        |
+| Team/view bar plus filter bar                                                | On every page; filters live in the URL, so a refresh or a shared link restores them                                                                                                                                                                                                     |
+| Only the current nav entry gets a full-row light gray background             | Kept as is; common views such as at-risk customers and overdue invoices are sidebar entries too, with counts that match the target page                                                                                                                                                 |
+
+The overview columns and the customer board columns are the same component, so both pages share surfaces, spacing and cards.
+
+![Customer board: trialing, paying and needs-attention columns expanded; churned and expired trials collapsed into the rightmost column](/images/posts/design-extraction-saas-dashboard/customers-board.png)
+
+## When a rule collides with the dashboard
+
+"No big headings or stat cards" collides head-on with a dashboard. The fix was to turn MRR (monthly recurring revenue), paying customers, net new MRR and monthly churn into switch tabs along the top of the main chart card; click one and the chart below plots it. The figures use 20/24 at weight 500, the only size above 13px on the site. The page name appears only in the view bar at 13px medium, and there is no page heading.
+
+Color follows the spec's "little colored area, used mainly for identification": the main chart line is dark gray `#2B2B31`, the previous period is a light gray dashed line, the three plans are three shades of gray, and negative net-new bars are light gray. The remaining color sits in status glyphs, the 6px dots on labels, owner avatars and the 12px change figures.
+
+Anything the spec did not cover was derived from the same rules: the risk red, the 20px figure size, chart styling, form layout, the 8px dialog radius, and how empty and error states look.
+
+## Simulated data behind every number
+
+Whether a dashboard looks real depends heavily on its numbers. A seeded generator simulates the data: daily signups from June 3, 2024, 14-day trials, probabilistic conversion, upgrades, downgrades, churn and reactivation, then invoices for the last 100 days derived from each customer's subscription history. Every metric is computed from this one dataset.
+
+The first run's stats had two tells. Enterprise plans made up 68.9% of revenue, and not a single customer had churned in the last 30 days, so churn would show 0.0%. After raising churn probabilities, lowering the enterprise share and expansion sizes, and then narrowing the enterprise price range, enterprise sits at 54.7% and 30-day monthly churn at 2.0%. The final dataset has 314 customers (100 paying, 10 needing attention, 5 trialing, 20 churned, 179 expired trials), 336 invoices and MRR of ¥131,797.
+
+Shared data makes changes ripple. The overview's three plan-mix rows add up to MRR; creating a paying customer moves MRR, the paying count, net new and the activity feed together; collecting an overdue payment lowers both overdue invoices and at-risk customers.
+
+## Screenshots and click checks without a server
+
+My global rules forbid starting a dev server on my own, so verification worked like this: static-export to `out/`, drive the local Edge through Playwright (`channel: "msedge"`), intercept requests to `http://tessel.local/*`, and answer them with files from `out/` via `route.fulfill`. No server process ran at any point:
+
+```js
+await context.route("http://tessel.local/**", async (route) => {
+  let path = decodeURIComponent(new URL(route.request().url()).pathname);
+  if (path.endsWith("/")) path += "index.html";
+  let file = join(OUT, path);
+  if (!extname(path)) file += ".html"; // /customers → customers.html
+  const body = await readFile(file);
+  await route.fulfill({ status: 200, body, contentType: TYPES[extname(file)] });
+});
+```
+
+The screenshot script takes 10 page shots across five widths (1440, 1280, 1024, 768 and 390) and 15 interaction states, including the filter menu, a filtered overview, display settings, search results and an empty search, customer details, an empty name on create, a local save failure, a failed payment retry, the mobile sidebar and an empty filter result. Four extra shots cover keyboard focus, a collapsed sidebar, and an overlong name on the board and in the list.
+
+The click script runs 13 checks, and all of them pass:
+
+- The three plan-mix rows add up to the MRR tab: ¥131,797 both ways.
+- The sidebar's at-risk count equals the overview's needs-attention column: 10 and 10.
+- Pressing C to create a paying Team-plan customer: MRR goes from ¥131,797 to ¥132,496, paying customers from 110 to 111, 30-day net new from ¥14,677 to ¥15,376, and the new customer tops the activity feed.
+- Marking Sparrow Dance Academy's failed invoice as paid: overdue invoices drop from 7 to 6. Payment failure was the customer's only risk reason, so at-risk customers drop from 10 to 9, matching the needs-attention group on the customers page.
+- The new customer survives a refresh, search finds it, a search for a nonexistent name shows the empty-result message, and the console stays free of errors.
+
+## Problems the checks caught
+
+- At 1280px the metric tabs could not fit the figure and its change on one line. Some wrapped and some did not, leaving the four cells uneven. The label and the change now share the first line, and the figure gets its own.
+- Filtering by status left the board with a single column stretched across the whole workspace. Columns are now capped at 360px.
+- Keyboard focus outlines were invisible. Tailwind 4 compiles `outline-none` to `--tw-outline-style:none;outline-style:none`, while `focus-visible:outline-2` compiles to `outline-style:var(--tw-outline-style);outline-width:2px`, so on focus the style still resolved to none. Adding `focus-visible:outline-solid` to every focus style brought the outline back.
+- Counts in the filter menu and IDs in search results used `#8F8F98`. As 12px text on white that is about 3.2:1, below 4.5:1. They now use `#62626B`, about 6.0:1.
+- On this Windows 11 machine, the Next.js 16.3.6 static export wrote segment prefetch files into a subdirectory, `customers/__next.customers/__PAGE__.txt`, while the browser requested `customers/__next.customers.__PAGE__.txt`, so the console logged 404s. Navigation itself uses `customers.txt` and was unaffected. A post-build script now copies each file to the dotted name; whether Linux behaves the same is untested.
+- The data lives in the browser. In dev mode the server would render from the sample data while the browser renders from local storage, and whenever the two differ, React reports a hydration mismatch as it takes over the page. The shell now renders only once the browser is ready, and the server outputs just the skeleton. This was a preventive change based on reasoning; no dev server was started to confirm it.
+
+## The score and its limits
+
+I gave it 10 on the condition that it never saw the original screenshot. When I pressed, it listed every file it had read during the session. From the source project it opened only `设计提炼.md`, the spec itself. Beyond that it read the repo root's readme, roadmap and experiment module doc, and one commit log that listed airbnb-home's file names. The only images it viewed were screenshots of its own build.
+
+Two things earned that score. First, the spec is precise: sizes, type, radii and stroke widths are numbers, and it spells out structure and intent. Second, the model's priors. In Claude Code's own assessment, the spec clearly comes from a Linear-style board, and it filled what the spec left out, such as how the sidebar is sectioned, what the filter bar looks like and how charts are drawn, from familiarity with that kind of product. "Look at nothing else" can block files; it cannot block interfaces seen in training.
+
+To separate the two, the next step is to distill a spec from a screenshot with no famous prototype, such as a niche tool, a hand-drawn style or an unusual layout, and rebuild it from the spec alone.
+
+The previous round concluded that information design should come first and the look should be handed out as a spec written in numbers; see [AI-Built Pages Look Templated and Hollow](/en/posts/ai-frontend-info-design-first). This time a numeric spec was the entire input, and the design language carried over to a different kind of product. How much of that the priors account for is what the control experiment above would answer.
+
+## What this design suits
+
+I asked one more question: what kind of site does this spec suit? Claude Code's test is three questions. Do users spend hours in it every day, working through the same kind of item? Do those items have a few clear states? Is it used mainly on a computer? Three yeses mean a good fit.
+
+- Good fit: task, project and bug tracking; stage-based business tools such as sales pipelines, hiring pipelines, support tickets, content review and publishing schedules, and procurement approvals; back offices for orders, inventory and billing; developer tools, once a dark theme is added; personal productivity tools such as to-do lists, message centers and knowledge bases.
+- Workable with changes: metric-heavy dashboards, where many chart lines blur together in grays and need a dedicated chart palette; help-center body text, which should grow to 15–16px; the same product's marketing home page, which needs big headings.
+- Poor fit: marketing landing pages and brand sites, consumer storefronts, long-form reading such as news and blogs, mobile-first consumer apps, products for older or low-vision users, portfolios and games.
+
+## References
+
+- [Next.js: Static Exports](https://nextjs.org/docs/app/guides/static-exports)
+- [Tailwind CSS: outline-style](https://tailwindcss.com/docs/outline-style)
+- [Playwright: Route](https://playwright.dev/docs/api/class-route)
+- [Playwright: Browsers (Microsoft Edge channel)](https://playwright.dev/docs/browsers)
+- [WCAG 2.2 Understanding SC 1.4.3 Contrast (Minimum)](https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html)
+- Related post: [AI-Built Pages Look Templated and Hollow: Do Information Design First, Then Spec the Look in Numbers](/en/posts/ai-frontend-info-design-first)
