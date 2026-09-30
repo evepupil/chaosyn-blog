@@ -3,6 +3,9 @@ import path from "node:path";
 
 import { XMLParser } from "fast-xml-parser";
 import { parse, type DefaultTreeAdapterMap } from "parse5";
+import remarkParse from "remark-parse";
+import { unified } from "unified";
+import { visit } from "unist-util-visit";
 
 import { resolveSiteUrl } from "@/lib/site-config";
 import {
@@ -34,6 +37,7 @@ const requiredFiles = [
   "en/links/index.html",
   "en/rss.xml",
   "links/index.html",
+  "llms.txt",
   "robots.txt",
   "rss.xml",
   "search-index/en.json",
@@ -473,6 +477,57 @@ async function checkXmlUrls(
   }
 }
 
+async function checkLlmsFile(errors: string[]): Promise<void> {
+  const relativePath = "llms.txt";
+  const source = await readFile(
+    path.join(outputDirectory, relativePath),
+    "utf8",
+  );
+  const tree = unified().use(remarkParse).parse(source);
+  const firstNode = tree.children[0];
+
+  if (firstNode?.type !== "heading" || firstNode.depth !== 1) {
+    errors.push(`${relativePath}: first element must be one H1 heading.`);
+  }
+  if (!tree.children.some((node) => node.type === "blockquote")) {
+    errors.push(`${relativePath}: site summary blockquote is missing.`);
+  }
+  if (Buffer.byteLength(source, "utf8") > 128 * 1024) {
+    errors.push(`${relativePath}: file exceeds the 128 KiB context budget.`);
+  }
+
+  const urls: string[] = [];
+  visit(tree, "link", (node) => urls.push(node.url));
+  if (urls.length === 0) {
+    errors.push(`${relativePath}: no content links were found.`);
+    return;
+  }
+
+  const seen = new Set<string>();
+  for (const value of urls) {
+    let target: URL;
+    try {
+      target = new URL(value, siteUrl);
+    } catch {
+      errors.push(`${relativePath}: invalid URL ${value}.`);
+      continue;
+    }
+
+    if (seen.has(target.toString())) {
+      errors.push(`${relativePath}: duplicate URL ${target.toString()}.`);
+      continue;
+    }
+    seen.add(target.toString());
+
+    if (
+      target.origin === siteUrl.origin &&
+      !(await outputPathExists(target.pathname))
+    ) {
+      errors.push(`${relativePath}: missing local target ${target.pathname}.`);
+    }
+  }
+}
+
 async function main() {
   const errors: string[] = [];
 
@@ -492,6 +547,7 @@ async function main() {
   await checkHeadersFile(errors);
   await checkRedirectsFile(errors);
   await checkWorkerRoutesFile(errors);
+  await checkLlmsFile(errors);
   await Promise.all(
     (["rss.xml", "en/rss.xml", "sitemap.xml"] as const).map((relativePath) =>
       checkXmlUrls(relativePath, errors),
@@ -503,7 +559,7 @@ async function main() {
   }
 
   console.log(
-    `Static output validated: ${htmlFiles.length} HTML files, RSS, sitemap and assets.`,
+    `Static output validated: ${htmlFiles.length} HTML files, llms.txt, RSS, sitemap and assets.`,
   );
 }
 

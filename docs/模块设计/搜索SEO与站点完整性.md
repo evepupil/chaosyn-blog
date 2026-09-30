@@ -2,13 +2,13 @@
 
 > **模块定位**：管理站内搜索、SEO 元数据、订阅文件、错误页与静态产物完整性
 >
-> **对应代码**：`features/search/`、`lib/search/`、`lib/seo/`、`lib/deployment/localized-not-found.ts`、`scripts/generate-search-index.ts`、`scripts/prepare-pages-output.ts`、`scripts/check-static-output.ts`
+> **对应代码**：`features/search/`、`lib/search/`、`lib/seo/`、`app/llms.txt/route.ts`、`lib/deployment/localized-not-found.ts`、`scripts/generate-search-index.ts`、`scripts/prepare-pages-output.ts`、`scripts/check-static-output.ts`
 >
 > **所属 M 里程碑**：[M5：搜索、SEO 与站点完整性](../roadmap.md#阶段-5搜索seo-与站点完整性)
 >
 > **当前状态**：已完成
 >
-> **最近更新时间**：2026-07-22
+> **最近更新时间**：2026-09-30
 
 ## 设计
 
@@ -26,6 +26,8 @@
 | `lib/seo/content-metadata.ts`      | 文章、图书、章节元数据和文章 JSON-LD        |
 | `lib/seo/rss.ts`                   | 中英文 RSS 数据与 XML 生成                  |
 | `lib/seo/sitemap.ts`               | 静态页面、内容、标签与译文站点地图          |
+| `lib/seo/llms.ts`                  | 双语 AI 内容目录生成                        |
+| `app/llms.txt/route.ts`            | 构建期静态生成根目录 `llms.txt`             |
 | `scripts/generate-search-index.ts` | 构建中英文序列化搜索索引                    |
 | `redirects.config.ts`              | 旧路径与旧文章 slug 的集中映射              |
 | `lib/redirects/`                   | 映射校验、规则展开和 `_redirects` 序列化    |
@@ -49,8 +51,15 @@
 8. 当前路由继续作为 canonical。旧站路径使用一跳 `301` 合并到对应新页面，不让兼容路径进入 sitemap 或 hreflang。
 9. `redirects.config.ts` 是重定向的唯一配置入口。文章换 slug 时删除旧正文、保留新正文，并把旧、新 slug 加入映射；构建会同时生成带尾斜杠和不带尾斜杠的旧地址规则，并把中文路径转成 Cloudflare 实际匹配的百分号编码。
 10. Cloudflare Pages 会沿请求目录向上寻找最近的 `404.html`。构建在 `out/en/404.html` 额外保存英文错误页，因此缺失的 `/en/*` 返回英文内容和 404 状态；根目录缺失地址继续使用中文 `out/404.html`。
+11. `llms.txt` 在构建期从当前已发布内容生成，列出中英文文章、图书入口和站点索引。草稿不会进入文件，标题、摘要和规范地址沿用内容系统，不维护第二份手写目录。
 
 ## 改动历史
+
+### 2026-09-30
+
+- 新增根目录 `llms.txt` 静态路由，为支持该约定的 AI 与代理提供双语文章、图书和站点索引。
+- 静态产物检查解析 Markdown 链接，验证文件结构、体积、重复地址和站内目标；部署冒烟检查线上状态、内容类型和双语章节。
+- 首版不生成 `llms-full.txt` 或逐页 Markdown 镜像。Cloudflare Markdown for Agents 仍是独立的可选运营配置。
 
 ### 2026-07-22
 
@@ -95,15 +104,17 @@
 - 文章、图书和章节通过 `translationKey` 找译文，缺少译文时不会输出错误 hreflang。
 - RSS 只包含对应语言的已发布文章，按发布时间倒序输出。
 - sitemap 包含首页、栏目、文章、图书、图书章节和文章标签；草稿与 404 不进入站点地图。
+- `llms.txt` 包含全部已发布中英文文章和图书入口，条目使用绝对规范地址与内容摘要，按站点现有发布顺序输出。
 
 ### 构建完整性
 
 `pnpm build` 依次执行内容校验、搜索索引、Next 静态导出和 `pnpm site:check`。产物检查会确认：
 
-- 必需的 RSS、sitemap、robots、中英文 404 和搜索索引文件存在；
+- 必需的 RSS、sitemap、robots、`llms.txt`、中英文 404 和搜索索引文件存在；
 - 每个正常页面具有正确 `lang`、唯一 canonical、当前语言 hreflang、Open Graph 图片和 Twitter Card；
 - 文章页包含可解析的 JSON-LD；404 页包含 `noindex`；
 - HTML、RSS 和 sitemap 中的站内地址都能映射到 `out` 中的文件或目录；
+- `llms.txt` 具有站点标题与摘要，文件不超过 128 KiB，Markdown 链接无重复且站内目标存在；
 - 图片、脚本、样式和站内链接没有缺失目标。
 
 ### 旧站 URL 迁移
@@ -125,6 +136,7 @@
 ## 测试方法
 
 - Vitest 覆盖分词、语言隔离、标题/标签/正文命中、RSS 草稿过滤、图书章节 sitemap、译文关系、canonical 和 JSON-LD。
+- Vitest 覆盖 `llms.txt` 的双语内容、草稿过滤、图书入口、Markdown 转义和绝对地址。
 - Playwright 覆盖中英文搜索、搜索结果导航、关键元数据、中英文 404 页面和关闭 JavaScript 后的阅读路径；`serve` 不模拟 Pages 的目录级错误页查找，真实缺失的英文地址由部署冒烟验证。
 - Vitest 覆盖映射展开、重复来源、重定向链和相同源目标校验。
 - `pnpm build` 重新生成 `_redirects` 并检查全部配置规则；部署后冒烟验证 18 个旧文章地址返回单跳 `301` 和正确目标。
@@ -134,3 +146,4 @@
 
 - 搜索索引随站点构建更新，没有在线增量索引。
 - canonical、RSS 和 sitemap 已使用 Pages 构建命令传入的 `NEXT_PUBLIC_SITE_URL`；正式域名切换时必须同步修改该值并重新提交 sitemap。
+- `llms.txt` 当前链接到规范 HTML 页面，没有生成 `llms-full.txt` 或逐页 Markdown 镜像；Cloudflare Markdown for Agents 尚未启用。

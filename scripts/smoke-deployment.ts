@@ -207,6 +207,17 @@ async function runCheck(baseUrl: URL, check: SmokeCheck): Promise<string> {
     if (check.path === "/robots.txt" && !text.includes("Sitemap:")) {
       throw new Error(`${check.path}: Sitemap declaration is missing.`);
     }
+    if (
+      check.path === "/llms.txt" &&
+      (!response.headers
+        .get("content-type")
+        ?.match(/^text\/(?:plain|markdown)/u) ||
+        !text.startsWith("# ") ||
+        !text.includes("## Chinese articles") ||
+        !text.includes("## English articles"))
+    ) {
+      throw new Error(`${check.path}: LLM content index is incomplete.`);
+    }
   }
 
   return `${check.path} (${response.status})`;
@@ -246,6 +257,7 @@ async function main() {
     { expectedStatus: 200, kind: "xml", path: "/rss.xml" },
     { expectedStatus: 200, kind: "xml", path: "/en/rss.xml" },
     { expectedStatus: 200, kind: "xml", path: "/sitemap.xml" },
+    { expectedStatus: 200, kind: "text", path: "/llms.txt" },
     { expectedStatus: 200, kind: "text", path: "/robots.txt" },
     {
       expectedStatus: 200,
