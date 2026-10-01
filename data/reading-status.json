@@ -1,5 +1,5 @@
 {
-  "activeDays": 231,
+  "activeDays": 232,
   "books": [
     {
       "author": "岸见一郎 古贺史健",
@@ -21,6 +21,6 @@
     }
   ],
   "finishedBooks": 14,
-  "totalMinutes": 4014,
-  "updatedAt": "2026-09-30T20:53:48.903Z"
+  "totalMinutes": 4017,
+  "updatedAt": "2026-10-01T21:08:54.010Z"
 }
