@@ -1,0 +1,121 @@
+---
+title: "I Rebuilt My Blog With Next.js and Open-Sourced It as chaosyn-blog"
+description: "chaosyn-blog replaces notion-fuwari: a bilingual blog that Next.js 16 exports as static files for Cloudflare Pages. Posts live in Git, arrive from Notion or an AI coding agent, and a build that fails its checks never ships."
+published: "2026-10-09"
+locale: "en"
+tags:
+  - "Open Source"
+  - "Cloudflare"
+  - "Frontend"
+draft: false
+pinned: false
+translationKey: "chaosyn-blog-system"
+---
+
+Since July 2026, my blog Chaosyn has run on chaosyn-blog, a new codebase that replaces [notion-fuwari](/en/posts/notion-fuwari-blog-system), which I introduced in March. Next.js 16 renders every page to static files at build time and Cloudflare Pages hosts them; only three endpoints run online, for AI Q&A, friend-link applications and the about page's data. Posts, books and images all live in the Git repository. The build validates the content first and checks every generated page and internal link last, and if anything fails, that commit never goes live.
+
+- Repository: [evepupil/chaosyn-blog](https://github.com/evepupil/chaosyn-blog)
+- Blog: [blog.chaosyn.com](https://blog.chaosyn.com)
+
+![The Chaosyn home page in Chinese: the tagline and reading links on the left, the author card and topic tags on the right](/images/posts/chaosyn-blog-system/home.png)
+
+## How it relates to notion-fuwari
+
+notion-fuwari was an Astro site customized from the open-source Fuwari theme. The new site keeps its main features: Notion sync, Chinese and English versions, books, AI Q&A and friend-link review. The interface was settled as an HTML prototype first, then built from scratch with Next.js 16, React 19, HeroUI 3 and Tailwind CSS 4, with TypeScript in strict mode.
+
+A rerunnable migration script moved the old content: 33 posts, the 31 images they actually reference, and 3 books with 26 chapters. It converts the old fields into the new strict format and skips images that no post references.
+
+URL changes live in one file, `redirects.config.ts`. The build turns it into Cloudflare Pages' `_redirects`, so every old address reaches its new one in a single 301. The changed addresses are 18 Chinese posts plus every English post, which moved from `/posts/en/<slug>/` to `/en/posts/<slug>/`. Rules written with raw Chinese paths never matched on Pages. A smoke script that requested each old address after launch exposed this, and the generator now writes the percent-encoded paths that browsers actually send.
+
+Analytics and ads keep the old site's Umami, GA4 and AdSense settings. Post view counts query both the old and the new path and add them up, so renamed posts still show their pre-migration totals; a reader who visited both addresses is counted twice as a visitor.
+
+## How posts get onto the site
+
+All content is Markdown/MDX in the repository: posts under `content/posts/zh/` and `content/posts/en/`, and one directory per book holding an `index.md` plus chapter files. Post bodies render as a safe Markdown subset; raw HTML and MDX components do not execute.
+
+The metadata block at the top of each file (the frontmatter) is strictly validated with Zod. An undeclared field, a malformed date, a duplicate tag, a file in the wrong language directory or a missing local image makes `pnpm content:check` report the file path, and the build stops. A Chinese post and its English version share one `translationKey`, which may appear only once per language, and the language switcher uses it to find the matching translation.
+
+The first way in is Notion. Every day at midnight Beijing time, GitHub Actions converts published pages to Markdown, downloads their images into the repository and, once validation passes, commits to `main`. Cloudflare Pages sees the new commit and builds it; the Action holds no Cloudflare credentials. Synced files carry `source: "notion"` and `notionPageId`, and the sync overwrites or deletes only files that have those fields. If a handwritten post has the same file name, the sync stops with an error. File names are pinned to the Notion page ID, so retitling a page does not create a second post.
+
+The second way in is committing straight to the repository. The repo includes a writing Skill for AI coding agents, an instruction file the agent follows, at `.agents/skills/problem-blog-writer/SKILL.md`. Given real material about a problem, the agent writes the Chinese and English posts with their metadata, runs content validation, the format check, lint, type checking, unit tests and a full build, and once all of them pass it commits only those posts and their images and pushes to `main`. All 16 bilingual post pairs added since September were committed directly to the repository, and this post was published with that Skill.
+
+## A build that fails never ships
+
+`pnpm build` runs these steps in order: generate redirect rules from `redirects.config.ts`, check the site URL when building on Cloudflare, validate all content, build the Chinese and English search indexes, statically export with Next.js to `out/`, compile the online endpoints into `out/_worker.js`, and finally parse every output file with `site:check`.
+
+`site:check` reads each HTML, XML and JSON file with a parser. Every page needs the right `<html lang>`, exactly one canonical URL, an hreflang for its own language, a share image and a Twitter Card. Post pages need parseable `BlogPosting` structured data, the 404 page needs `noindex`, and every internal link and asset referenced by pages, RSS and the sitemap must map to a file in `out/`. Cloudflare Pages runs the same command, so a commit whose build fails is never published and the live site stays on the previous version.
+
+This step has caught two real problems. Once, 5 posts still held 8 internal links to old addresses, and that production build failed outright. The other time, the scheduled Notion sync wrote 3 already-fixed links back to old addresses. Since then the sync first rewrites old links in post bodies through the same `redirects.config.ts` mapping, then writes the files.
+
+GitHub Actions runs formatting, lint, type checking, unit tests, Playwright end-to-end tests and the full build on every PR and every push to `main`. The end-to-end tests open the static export directly and do not depend on a dev server.
+
+One deployment detail concerns the site URL. The Cloudflare project stores `NEXT_PUBLIC_SITE_URL`, but this project's Git build logs showed that the variable never reached the build process, so the production domain is written into the Pages build command itself. When the build script sees `CF_PAGES=1`, it rejects a missing address, non-HTTPS, localhost and example.com, so canonical URLs, RSS and the sitemap cannot go live with the wrong domain.
+
+## Static pages and three online endpoints
+
+Every page is generated at build time, so the deployment is just the `out/` directory and needs no long-running Node.js process. Site links turn off Next.js' automatic prefetching: after a Next.js 16 static export, the file paths that prefetch requests ask for do not match the files in `out/`, and plain static hosting answers with 404s.
+
+The three online endpoints live in `functions/api/`. Pages' Git upload step did not reliably detect the source `functions/` directory, so the build bundles all three into a single `out/_worker.js`, which is Pages' advanced mode. `_routes.json` sends only `/api/*` to it, and Pages serves posts and static assets directly.
+
+Comments use Giscus; analytics use Umami, Cloudflare Web Analytics and GA4; ads use AdSense. Each one can be switched off in `site.config.ts`; a disabled integration loads no script, and a disabled ad slot does not even render a placeholder. The analytics and ad scripts originally loaded through `next/script`. A browser check after launch found that in the statically exported pages those tags carried an `inert` attribute and never executed, so all of them are now inserted with JavaScript after the page hydrates, that is, once the browser has taken over the page.
+
+The comment section connects to giscus.app only when it comes within 600 px of the viewport, and shows a retry button if it has not loaded within 15 seconds. With JavaScript disabled, site links, post bodies and book chapters still read normally, and Playwright has tests for that.
+
+## Chinese and English
+
+Chinese pages sit at the root and English pages under `/en/`. Each language has its own root layout, so the static HTML has the correct `<html lang>` before any JavaScript runs.
+
+The language switcher looks for the translation with the same `translationKey` and falls back to the target language's home page when none exists. A missing `/en/*` address shows an English 404: the build adds `out/en/404.html`, and Pages walks up the requested path to the nearest `404.html`. Search indexes and RSS feeds are also generated per language.
+
+## Site search and AI Q&A
+
+Regular search uses MiniSearch. Indexes are built per language at build time, and the search library and the current language's index download in parallel only when the search box opens for the first time, so reading a post never loads them. Chinese is tokenized into single characters and English into words; a result must match every term, prefix matching is on, and terms of 5 or more characters tolerate small typos.
+
+AI Q&A uses Cloudflare AutoRAG, since renamed AI Search, through the legacy `env.AI.autorag()` binding. When this project called `aiSearch()` in streaming mode, the source list could stay empty, so the endpoint works in two steps. It first calls `search()`, reranks the results with a BGE model and keeps at most 5 that clear the score threshold and map to pages on the site. With no reliable result it returns "no citations" and never calls the generation model; otherwise it calls `aiSearch()`, Llama 3.3 70B writes the answer, and the answer and citations stream back over SSE. For some overview-style questions the reranker filters out every result, and retrieval then falls back to plain vector search with reranking off and a 0.5 threshold.
+
+Rate limiting lives in D1: 6 requests per minute per visitor and 30 per minute site-wide, with both counters updated atomically in the same SQL batch. Pages Functions bindings do not include Workers Rate Limiting, and KV is eventually consistent, so concurrent increments across locations overwrite each other. The endpoint does not log questions, IP addresses or answers, and visitor counters are keyed by a hash that rotates daily.
+
+## The about page, friend links and llms.txt
+
+![The about page's "Last 365 days" section in Chinese: a GitHub contribution heatmap and AI token usage from TokenBoard](/images/posts/chaosyn-blog-system/about-activity.png)
+
+The about page shows only data that anyone can check. `/api/about-status` reads the GitHub contribution calendar and TokenBoard's AI token usage in parallel, each with an 8-second timeout and a 30-minute cache, and one source failing does not affect the other. The GitHub part parses the public contribution page's HTML; if it cannot read exact numbers, the whole block is marked unavailable instead of showing estimates. Cost and cache fields from TokenBoard are dropped inside the endpoint and never reach the browser. WeRead, Tencent's e-reading app, syncs through its official API in a separate Action every day at 00:30 Beijing time, keeps only the 3 most recent public books, and never writes private books or the API key to the repository. The technology radar is written directly in `site.config.ts`.
+
+Friend-link applications go to `/api/submit-friend-link`, which validates the origin, the fields and the HTTPS address, applies the D1 rate limit, and creates a "pending review" record in the Notion friend-link database. Once the site owner changes it to "approved" in Notion, the daily sync writes it into `data/friends.json` and downloads the avatar, and it appears on the friends page after the next build. The endpoint never edits the repository, so every change to the public list has a commit and can be rolled back.
+
+The root [llms.txt](https://blog.chaosyn.com/llms.txt) is generated from published content at build time. It lists posts, books and site entry points per language for AI tools that follow the convention, and drafts never appear in it.
+
+## If you want to use it
+
+Running it locally needs Node.js 22.14 and pnpm 10.21:
+
+```bash
+git clone https://github.com/evepupil/chaosyn-blog.git
+cd chaosyn-blog
+corepack enable
+pnpm install --frozen-lockfile
+cp .env.example .env.local
+pnpm dev
+```
+
+To turn it into your own site, change four things: the site name, author, social links and integration switches in `site.config.ts`; the avatar, share image and sponsorship QR code in `public/images/`; the Pages project name and D1 database in `wrangler.jsonc`; and the production domain. `site.config.ts` ships to the browser, so secrets such as the Notion token and the WeRead key belong only in `.env.local` and the deployment platform's secrets.
+
+After connecting Cloudflare Pages to the GitHub repository, set the build command to `NEXT_PUBLIC_SITE_URL=https://your-domain pnpm build`, set the output directory to `out`, and pick the same Node.js and pnpm versions as locally. Every external service is optional. The Notion sync exits with an error when its secrets are missing, so disable that scheduled workflow in GitHub if you do not use Notion; the WeRead sync skips itself without a key; and the AI Q&A and friend-link endpoints return 503 without their bindings or secrets, while reading is unaffected.
+
+To read the code, start with `lib/content/` for the content format and queries, then `scripts/` for the build, sync and check scripts, then `functions/api/` for the three online endpoints. `docs/roadmap.md` and `docs/模块设计/` (the module design docs, in Chinese) record each module's design decisions and the reason behind each change.
+
+## References
+
+- [evepupil/chaosyn-blog](https://github.com/evepupil/chaosyn-blog)
+- [Next.js: Static Exports](https://nextjs.org/docs/app/guides/static-exports)
+- [Cloudflare Pages: Advanced mode](https://developers.cloudflare.com/pages/functions/advanced-mode/)
+- [Cloudflare Pages: Functions routing](https://developers.cloudflare.com/pages/functions/routing/)
+- [Cloudflare Pages: Redirects](https://developers.cloudflare.com/pages/configuration/redirects/)
+- [Cloudflare Pages: Serving Pages](https://developers.cloudflare.com/pages/configuration/serving-pages/)
+- [Cloudflare Pages: Functions bindings](https://developers.cloudflare.com/pages/functions/bindings/)
+- [Cloudflare KV: How KV works](https://developers.cloudflare.com/kv/concepts/how-kv-works/)
+- [Cloudflare AI Search: Workers binding (legacy)](https://developers.cloudflare.com/ai-search/api/migration/workers-binding-legacy/)
+- [MiniSearch](https://github.com/lucaong/minisearch)
+- [giscus](https://giscus.app/)
+- [llms.txt](https://llmstxt.org/)
+- Related post: [An Open-Source Blog System I Use: notion-fuwari](/en/posts/notion-fuwari-blog-system)
