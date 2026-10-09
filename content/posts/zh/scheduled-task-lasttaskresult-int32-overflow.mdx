@@ -1,0 +1,101 @@
+---
+title: "PowerShell 读取计划任务上次运行结果报 Int32 溢出的解决办法"
+description: "Get-ScheduledTaskInfo 返回的 LastTaskResult 是无符号 32 位数，0x800710E0 这类失败码超过 Int32 上限，转成 [int] 会让整个查询报错。改用 [long] 读取、按十六进制显示；同一结果在 COM 接口里是负数，比较前要先统一。"
+published: "2026-10-10"
+locale: "zh-CN"
+tags:
+  - "postmortem"
+  - "Windows"
+  - "PowerShell"
+draft: false
+pinned: false
+translationKey: "scheduled-task-lasttaskresult-int32-overflow"
+---
+
+LeafPress 用 PowerShell 查询自己安装的计划任务，把 `Get-ScheduledTaskInfo` 返回的 `LastTaskResult`（上次运行结果）转成 `[int]` 写进 JSON。任务上次运行失败、结果码是 `0x800710E0` 这类大于 2147483647 的值时，类型转换直接报错，整个查询随之失败。`LastTaskResult` 的类型是 `UInt32`，改用 `[long]` 读取并按十六进制显示即可。
+
+## 问题详情
+
+查询脚本里读取上次运行结果的一行：
+
+```powershell
+$info = Get-ScheduledTaskInfo -InputObject $task
+[pscustomobject]@{ installed = $true; state = [string]$task.State; lastResult = [int]$info.LastTaskResult } | ConvertTo-Json -Compress -Depth 3
+```
+
+任务运行成功时，这行代码一切正常。评审时在本机找了一个上次结果大于 Int32 上限的系统任务 `\Microsoft\Windows\AppID\VerifiedPublisherCertStoreCheck`，用同样的写法查询，脚本报错退出：
+
+```text
+Cannot convert value "2147946720" to type "System.Int32". Error: "Value was either too large or too small for an Int32."
+    + CategoryInfo          : InvalidArgument: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : InvalidCastIConvertible
+```
+
+查询脚本开着 `$ErrorActionPreference = 'Stop'`，这一行出错，整次查询就失败了。LeafPress 最初还把查询失败当成「任务没装」，同一轮评审一并修正。按当时的代码逻辑，自己的任务上次运行失败、结果码又超过 Int32 上限时，状态会显示成没装；这时执行卸载，任务会留在系统里，启动脚本却被删掉，之后每天空跑失败。
+
+## 排查与原因
+
+### LastTaskResult 是无符号 32 位数
+
+在 Windows PowerShell 5.1 里直接查看这个字段：
+
+```text
+LastTaskResult = 2147946720 (System.UInt32), hex 0x800710E0
+[long] -> 2147946720
+[int] -> 无法将值“2147946720”转换为类型“System.Int32”。错误:“值对于 Int32 太大或太小。”
+```
+
+`LastTaskResult` 记录任务上次运行的结果，可能是程序的退出码，也可能是 HRESULT 格式的状态码。HRESULT 的最高位表示失败，所以失败码都在 `0x80000000` 以上，按无符号数看就超过了 Int32 的上限 2147483647。`0x800710E0` 由 Win32 错误 4320 转换而来，含义是「操作员或系统管理员拒绝了请求。」。这台机器上，`\Microsoft\Windows\` 下有 7 个系统任务的上次结果落在这个范围内。
+
+程序自己的退出码也可能超过这个上限。进程因 Ctrl+C 结束时的退出码 `0xC000013A`，按无符号数是 3221225786。
+
+### 同一个结果，COM 接口给的是负数
+
+通过 COM 对象 `Schedule.Service` 读同一个任务：
+
+```text
+COM LastTaskResult = -2147020576 (System.Int32)
+```
+
+COM 接口 `IRegisteredTask::get_LastTaskResult` 的参数类型是 `LONG`，有符号；`Get-ScheduledTaskInfo` 返回的是无符号数。两者是同一组 32 位，只是解释方式不同。查资料时两种写法都会遇到，比较前先换成同一种表示，十六进制最不容易出错。
+
+## 解决办法
+
+```powershell
+lastResult = [long]$info.LastTaskResult
+```
+
+`[long]` 是 64 位整数，装得下全部无符号 32 位的值。`ConvertTo-Json` 输出数字 2147946720，Node 端按普通数字读取，不会丢精度。
+
+给人看的说明在 Node 端生成，几个特殊值单独处理，大于 `0xFFFF` 的按十六进制显示，方便对照文档查含义：
+
+```ts
+export function describeLastResult(code: number | undefined): string {
+  if (code === undefined) return "未知";
+  if (code === 267011) return "还没运行过";
+  if (code === 267009) return "正在运行";
+  if (code === 0) return "成功";
+  // 超过 0xFFFF 的是系统的错误码（如 0x800710E0、0xC000013A），用十六进制写才查得到；
+  // 小的是程序自己的退出码，十进制就是它本来的样子
+  if (code > 0xffff) return `失败（代码 0x${code.toString(16).toUpperCase()}）`;
+  return `失败（代码 ${code}）`;
+}
+```
+
+267011 是 `SCHED_S_TASK_HAS_NOT_RUN`（0x00041303，任务还没运行过），267009 是 `SCHED_S_TASK_RUNNING`（0x00041301，任务正在运行）。
+
+查询失败也不再当成没装：只有 `Get-ScheduledTask` 明确报告找不到任务时才算没装，在 Windows 11 上表现为 `CimJobException`、错误类别 `ObjectNotFound`；拒绝访问之类的其他错误一律作为查询失败上报。
+
+## 验证结果
+
+- 2026 年 10 月 10 日在本机重新确认：上面那个系统任务的 `LastTaskResult` 是 `System.UInt32` 类型的 2147946720，`[long]` 转换正常，`[int]` 转换报错。
+- 集成测试在真实的 PowerShell 里，用同名函数替换 `Get-ScheduledTask` 和 `Get-ScheduledTaskInfo`，让上次结果分别为 `0x800710E0`、`0xC000013A`、`0xFFFFFFFF`，查询都返回正确的数字；拒绝访问和命令不存在都不会被当成没装。
+- 在真实的任务计划程序里注册测试任务并手动运行：node 以 `0xC000013A` 退出的任务，查询得到 3221225786，显示为「失败（代码 0xC000013A）」；node 路径不存在的任务显示为「失败（代码 1）」。
+
+## 参考资料
+
+- [Microsoft Learn：Get-ScheduledTaskInfo](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/get-scheduledtaskinfo)
+- [Microsoft Learn：IRegisteredTask::get_LastTaskResult](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-iregisteredtask-get_lasttaskresult)：COM 接口以 `LONG` 返回上次运行结果
+- [Microsoft Learn：Task Scheduler Error and Success Constants](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-error-and-success-constants)：`SCHED_S_TASK_HAS_NOT_RUN`、`SCHED_S_TASK_RUNNING`
+- [Microsoft Learn：HRESULT](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/0642cb2f-2075-4469-918c-4441e69c548a)：最高位 S 表示失败
+- [Microsoft Learn：System Error Codes (4000-5999)](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--4000-5999-)：`ERROR_REQUEST_REFUSED`（4320）

@@ -1,0 +1,101 @@
+---
+title: "Fixing the Int32 Overflow When PowerShell Reads a Scheduled Task's LastTaskResult"
+description: "Get-ScheduledTaskInfo returns LastTaskResult as UInt32, and failure codes such as 0x800710E0 exceed Int32, so an [int] cast breaks the query. Read it as [long] and show it in hex; COM reports the same result as a negative number."
+published: "2026-10-10"
+locale: "en"
+tags:
+  - "postmortem"
+  - "Windows"
+  - "PowerShell"
+draft: false
+pinned: false
+translationKey: "scheduled-task-lasttaskresult-int32-overflow"
+---
+
+LeafPress queries the scheduled task it installs with PowerShell and casts the `LastTaskResult` (last run result) from `Get-ScheduledTaskInfo` to `[int]` before writing it to JSON. When the task's last run failed with a code such as `0x800710E0`, which is larger than 2147483647, the cast throws and the whole query fails. `LastTaskResult` is a `UInt32`, so the fix is to read it as `[long]` and display it in hexadecimal.
+
+## Problem details
+
+The line in the query script that reads the last run result:
+
+```powershell
+$info = Get-ScheduledTaskInfo -InputObject $task
+[pscustomobject]@{ installed = $true; state = [string]$task.State; lastResult = [int]$info.LastTaskResult } | ConvertTo-Json -Compress -Depth 3
+```
+
+This line works whenever the task succeeds. During review, a system task on the same machine whose last result exceeds the Int32 range, `\Microsoft\Windows\AppID\VerifiedPublisherCertStoreCheck`, was queried the same way, and the script failed:
+
+```text
+Cannot convert value "2147946720" to type "System.Int32". Error: "Value was either too large or too small for an Int32."
+    + CategoryInfo          : InvalidArgument: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : InvalidCastIConvertible
+```
+
+The query script runs with `$ErrorActionPreference = 'Stop'`, so an error on this line fails the entire query. LeafPress also originally treated any failed query as "task not installed", which the same review corrected. Under that code, when its own task's last run failed with a code beyond the Int32 range, the status would show the task as not installed. Uninstalling at that point would leave the task in the system while deleting its launcher script, and the task would then fail every day.
+
+## Investigation and cause
+
+### LastTaskResult is an unsigned 32-bit number
+
+Inspecting the field directly in Windows PowerShell 5.1:
+
+```text
+LastTaskResult = 2147946720 (System.UInt32), hex 0x800710E0
+[long] -> 2147946720
+[int] -> 无法将值“2147946720”转换为类型“System.Int32”。错误:“值对于 Int32 太大或太小。”
+```
+
+The last line is the same conversion error as above, shown in Chinese. `LastTaskResult` records the result of the task's last run, which can be the program's exit code or a status code in HRESULT format. The top bit of an HRESULT marks failure, so every failure code is at least `0x80000000`, which read as an unsigned number exceeds the Int32 maximum of 2147483647. `0x800710E0` is derived from Win32 error 4320, "The operator or administrator has refused the request." On this machine, 7 system tasks under `\Microsoft\Windows\` had a last result in that range.
+
+A program's own exit code can exceed the limit too. A process ended by Ctrl+C exits with `0xC000013A`, which is 3221225786 as an unsigned number.
+
+### COM reports the same result as a negative number
+
+Reading the same task through the `Schedule.Service` COM object:
+
+```text
+COM LastTaskResult = -2147020576 (System.Int32)
+```
+
+The COM method `IRegisteredTask::get_LastTaskResult` returns a signed `LONG`, while `Get-ScheduledTaskInfo` returns an unsigned value. Both are the same 32 bits interpreted differently. Both forms appear when you search for a code, so convert to one representation before comparing; hexadecimal is the least error-prone.
+
+## Solution
+
+```powershell
+lastResult = [long]$info.LastTaskResult
+```
+
+`[long]` is a 64-bit integer and holds every unsigned 32-bit value. `ConvertTo-Json` emits the number 2147946720, and Node reads it as a regular number without losing precision.
+
+The human-readable text is produced on the Node side. A few special values get their own wording, and anything above `0xFFFF` is shown in hexadecimal so it can be looked up in the documentation:
+
+```ts
+export function describeLastResult(code: number | undefined): string {
+  if (code === undefined) return "未知";
+  if (code === 267011) return "还没运行过";
+  if (code === 267009) return "正在运行";
+  if (code === 0) return "成功";
+  // Codes above 0xFFFF are system error codes (such as 0x800710E0 or 0xC000013A) and only searchable in hex;
+  // smaller ones are the program's own exit codes, which read naturally in decimal
+  if (code > 0xffff) return `失败（代码 0x${code.toString(16).toUpperCase()}）`;
+  return `失败（代码 ${code}）`;
+}
+```
+
+The strings read "unknown", "has not run yet", "running", "succeeded", and "failed (code …)". 267011 is `SCHED_S_TASK_HAS_NOT_RUN` (0x00041303, the task has not run yet), and 267009 is `SCHED_S_TASK_RUNNING` (0x00041301, the task is running).
+
+A failed query no longer means "not installed" either. The task counts as not installed only when `Get-ScheduledTask` explicitly reports that it cannot find it, which on Windows 11 is a `CimJobException` with the error category `ObjectNotFound`. Any other error, such as access denied, is reported as a failed query.
+
+## Verification results
+
+- Rechecked on this machine on October 10, 2026: the system task above has a `LastTaskResult` of 2147946720 of type `System.UInt32`, the `[long]` conversion works, and the `[int]` conversion fails.
+- An integration test runs the real query script in real PowerShell, with same-named functions standing in for `Get-ScheduledTask` and `Get-ScheduledTaskInfo` so the last result is `0x800710E0`, `0xC000013A`, or `0xFFFFFFFF`. Each query returns the correct number, and neither access denied nor a missing command is treated as "not installed".
+- Test tasks were registered in the real Task Scheduler and run by hand. A task whose node process exited with `0xC000013A` queried as 3221225786 and displayed as failed with code 0xC000013A. A task whose node path did not exist displayed as failed with code 1.
+
+## References
+
+- [Microsoft Learn: Get-ScheduledTaskInfo](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/get-scheduledtaskinfo)
+- [Microsoft Learn: IRegisteredTask::get_LastTaskResult](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-iregisteredtask-get_lasttaskresult): the COM interface returns the last run result as a `LONG`
+- [Microsoft Learn: Task Scheduler Error and Success Constants](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-error-and-success-constants): `SCHED_S_TASK_HAS_NOT_RUN` and `SCHED_S_TASK_RUNNING`
+- [Microsoft Learn: HRESULT](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/0642cb2f-2075-4469-918c-4441e69c548a): the S bit marks failure
+- [Microsoft Learn: System Error Codes (4000-5999)](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--4000-5999-): `ERROR_REQUEST_REFUSED` (4320)
