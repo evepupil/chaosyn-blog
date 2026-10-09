@@ -1,0 +1,147 @@
+---
+title: "Windows PowerShell 5.1 Garbles Chinese Paths in UTF-8 Scripts Without a BOM"
+description: "Node writes .ps1 files as UTF-8 without a BOM, which Windows PowerShell 5.1 reads as ANSI (GBK on Chinese Windows), breaking Chinese paths and sometimes a closing quote. Write a BOM, and exit nonzero when Start-Process fails."
+published: "2026-10-10"
+locale: "en"
+tags:
+  - "postmortem"
+  - "Windows"
+  - "PowerShell"
+draft: false
+pinned: false
+translationKey: "powershell-utf8-bom-chinese-path"
+---
+
+LeafPress pulls data once a day through Windows Task Scheduler, and the scheduled task runs a PowerShell launcher script that the program generates. Node writes files as UTF-8 without a BOM by default, and Windows PowerShell 5.1 interprets such a script in the system ANSI code page, which is GBK on Chinese Windows: the folder name "数据目录" in a path was read as "鏁版嵁鐩綍", and a string ending in a full-width colon lost its closing quote. Writing a BOM at the start of the script fixed both. Separately, when Start-Process fails to start the program, the script still exits with 0 by default, which needs its own fix.
+
+## Problem details
+
+The scheduled task's action is:
+
+```text
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "<launcher script>"
+```
+
+The `powershell.exe` that ships with Windows is Windows PowerShell 5.1; PowerShell 7 is a separate install. Node generates the launcher script, which contains the node path, the entry file, the data directory, and a few error messages in Chinese. When the data directory sits under a Chinese user name, those paths contain Chinese characters too.
+
+The issue was raised in a design review. The reproduction below uses two minimal scripts, each saved with and without a BOM (the three bytes `EF BB BF` at the start of a file that mark it as UTF-8), and runs them with `-File` in Windows PowerShell 5.1.26100.
+
+The first script has Chinese characters only in a path:
+
+```powershell
+$dir = Join-Path $PSScriptRoot '数据目录'
+'Test-Path: ' + (Test-Path -LiteralPath $dir)
+$p = Start-Process -FilePath 'node.exe' -ArgumentList ('"' + (Join-Path $dir 'main.js') + '"') -Wait -PassThru -WindowStyle Hidden
+'node exit code: ' + $p.ExitCode
+exit $p.ExitCode
+```
+
+|                | Without BOM | With BOM |
+| -------------- | ----------- | -------- |
+| `Test-Path`    | `False`     | `True`   |
+| node exit code | 1           | 0        |
+| `main.js` ran  | No          | Yes      |
+
+Without the BOM, node reported `Error: Cannot find module '…\鏁版嵁鐩綍\main.js'`; the script had read the folder name wrong.
+
+The second script holds a Chinese message ("cannot start node:") that ends in a full-width colon:
+
+```powershell
+$message = '无法启动 node：'
+$message
+```
+
+With the BOM it prints the message unchanged. Without the BOM it fails to parse and the script exits with 1. The parser reports that the string is missing its terminator:
+
+```text
+所在位置 …\message-nobom.ps1:1 字符: 12
++ $message = '鏃犳硶鍚鍔 node锛?
++            ~~~~~~~~~~~~~~
+字符串缺少终止符: '。
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : TerminatorExpectedAtEndOfString
+```
+
+Both BOM-less scripts ran correctly in PowerShell 7.6.6.
+
+## Investigation and cause
+
+### Windows PowerShell 5.1 reads BOM-less scripts in the ANSI code page
+
+Microsoft's about_Character_Encoding states that the PowerShell engine uses ANSI when it reads source code from files that have no BOM. Scripts that contain non-ASCII characters must be saved as UTF-8 with a BOM; otherwise Windows PowerShell interprets them in the legacy ANSI code page. The ANSI code page is the encoding Windows keeps for programs that do not use Unicode, and on Simplified Chinese systems it is 936, or GBK. PowerShell 6 and later read BOM-less files as UTF-8, which is why the same scripts work in PowerShell 7.
+
+Node's `fs.writeFileSync(file, text, "utf8")` writes no BOM. The UTF-8 encoding of "数据目录" is 12 bytes, `e6 95 b0 e6 8d ae e7 9b ae e5 bd 95`. Read as GBK two bytes at a time, they become six characters, "鏁版嵁鐩綍", one of which falls in GBK's user-defined area and does not display. The string in the script has already changed, so every path built from it points to a folder that does not exist.
+
+### An odd byte left over swallows the closing quote
+
+GBK encodes a Chinese character in two bytes, while UTF-8 uses three bytes for Chinese characters and full-width punctuation, so pairing the bytes two at a time can leave one over. The full-width colon "：" is `ef bc 9a` in UTF-8. Read as GBK, `ef bc` becomes "锛", and the leftover `9a` is the first half of a GBK double-byte character, so it takes the following single quote `27` as its second half and the two bytes decode to one question mark. Decoding that line of the second script with .NET's code page 936 shows it:
+
+```text
+UTF-8: 24 6d 65 73 73 61 67 65 20 3d 20 27 e6 97 a0 e6 b3 95 e5 90 af e5 8a a8 20 6e 6f 64 65 ef bc 9a 27
+GBK:   $message = '鏃犳硶鍚鍔 node锛?
+```
+
+With the closing quote gone, PowerShell cannot find the end of the string. A wrong path only surfaces when that line runs, while a syntax error stops the whole script before any line runs.
+
+### The script still exits with 0 when Start-Process fails
+
+The launcher's last line was `exit $p.ExitCode`. When Start-Process itself fails, for example because a misread `-FilePath` points to a program that does not exist, PowerShell only writes a record to its error stream, `$p` stays `$null`, and `exit $null` exits with 0. Starting a program in a Chinese-named folder from a BOM-less script reproduced this. PowerShell reported the error below, which says the system cannot find the specified file, and the script's exit code was still 0:
+
+```text
+Start-Process : 由于出现以下错误，无法运行此命令: 系统找不到指定的文件。。
+```
+
+Task Scheduler records the run result from the exit code, so 0 is recorded as success. The window is hidden, so nobody sees the error either.
+
+## Solution
+
+### Write the launcher script as UTF-8 with a BOM
+
+```ts
+writeFileAtomic(
+  wrapperPath,
+  `﻿${buildWrapperScript({ nodePath, entryPath, homePath })}`,
+);
+```
+
+`﻿` encoded as UTF-8 is `EF BB BF`. The same Microsoft article warns that a BOM can trouble Unix-style tools such as `cat`, `sed`, and `awk`, so LeafPress adds a BOM only to scripts that Windows PowerShell 5.1 runs, and keeps its own logs in UTF-8 without a BOM.
+
+### Exit with 1 when Start-Process fails
+
+The launcher now has the structure below (paths are replaced with variables for readability):
+
+```powershell
+$process = $null
+$failure = $null
+try {
+  New-Item -ItemType Directory -Force -Path $logsPath | Out-Null
+  $process = Start-Process -FilePath $nodePath -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru `
+    -RedirectStandardOutput $stdoutPath -RedirectStandardError $errorLog -ErrorAction Stop
+} catch {
+  $failure = $_.Exception.Message
+}
+if ($null -eq $failure -and $null -eq $process) { $failure = 'Start-Process 没有返回进程对象' }
+if ($null -eq $failure -and $null -eq $process.ExitCode) { $failure = '拿不到 node 的退出码' }
+if ($null -ne $failure) {
+  try { [IO.File]::WriteAllText($errorLog, '无法启动 node（' + $nodePath + '）：' + $failure, (New-Object Text.UTF8Encoding($false))) } catch { }
+  exit 1
+}
+exit $process.ExitCode
+```
+
+The two fallback messages mean "Start-Process returned no process object" and "could not get node's exit code". `-ErrorAction Stop` turns the Start-Process error into an exception that `catch` can handle. On failure, the script writes the reason to the error log and exits with 1, so Task Scheduler records a failure.
+
+Generated scripts usually put paths in PowerShell single-quoted strings, where each `'` must be doubled. PowerShell also treats the curly single quotes `‘` and `’`, which Chinese input methods often produce, as single quotes. A path containing `’` ends the string early with an "unexpected token in expression or statement" error, so those characters need doubling as well.
+
+## Verification results
+
+- The comparison of the two scripts is in "Problem details": with the BOM, `Test-Path` returned `True`, node exited with 0, and the Chinese message printed unchanged.
+- A LeafPress test checks that the generated launcher script starts with `EF BB BF`.
+- A test task whose node path did not exist was registered in the real Task Scheduler and run once by hand. Its last run result was 1, and the error log said that node could not be started at `…\definitely-missing\node.exe` because the system could not find the specified file.
+
+These results come from Windows PowerShell 5.1.26100 and PowerShell 7.6.6 on a system whose ANSI code page is 936.
+
+## References
+
+- [Microsoft Learn: about_Character_Encoding (Windows PowerShell 5.1)](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_character_encoding?view=powershell-5.1): BOM-less scripts are read in the ANSI code page, and scripts with non-ASCII characters should be saved as UTF-8 with a BOM
+- [Microsoft Learn: about_Quoting_Rules (Windows PowerShell 5.1)](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_quoting_rules?view=powershell-5.1): smart quotation marks are treated as normal quotation marks

@@ -1,0 +1,147 @@
+---
+title: "PowerShell 5.1 脚本里的中文路径变成乱码，存成带 BOM 的 UTF-8 解决"
+description: "Node 写出的 .ps1 默认是不带 BOM 的 UTF-8，Windows PowerShell 5.1 会按系统 ANSI 代码页（中文系统为 GBK）读取：中文路径失效，有的中文字符串还会吞掉结束引号。脚本开头写入 BOM 即可；Start-Process 起不来时还要主动以非零退出。"
+published: "2026-10-10"
+locale: "zh-CN"
+tags:
+  - "postmortem"
+  - "Windows"
+  - "PowerShell"
+draft: false
+pinned: false
+translationKey: "powershell-utf8-bom-chinese-path"
+---
+
+LeafPress 用 Windows 计划任务每天运行一次数据拉取，计划任务执行的是程序生成的 PowerShell 启动脚本。Node 写文件默认是不带 BOM 的 UTF-8，Windows PowerShell 5.1 读到这样的脚本时按系统的 ANSI 代码页解释，中文系统上就是 GBK：路径里的「数据目录」被读成「鏁版嵁鐩綍」，以全角冒号结尾的字符串还会丢掉结束引号。脚本开头写入 BOM 后恢复正常；另外，Start-Process 没能启动程序时，脚本默认仍以 0 退出，需要单独处理。
+
+## 问题详情
+
+计划任务的动作是：
+
+```text
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "<启动脚本>"
+```
+
+Windows 自带的 `powershell.exe` 是 Windows PowerShell 5.1，PowerShell 7 需要另外安装。启动脚本由 Node 生成，里面写着 node 的路径、入口文件、数据目录和几句中文错误提示。数据目录在中文用户名下时，这些路径也带中文。
+
+这个问题在设计评审时被指出。下面用两份最小脚本复现，每份都存成不带 BOM 和带 BOM 两个版本（BOM 是文件开头标明编码的三个字节 `EF BB BF`），在 Windows PowerShell 5.1.26100 里用 `-File` 运行。
+
+第一份脚本只有路径里有中文：
+
+```powershell
+$dir = Join-Path $PSScriptRoot '数据目录'
+'Test-Path: ' + (Test-Path -LiteralPath $dir)
+$p = Start-Process -FilePath 'node.exe' -ArgumentList ('"' + (Join-Path $dir 'main.js') + '"') -Wait -PassThru -WindowStyle Hidden
+'node exit code: ' + $p.ExitCode
+exit $p.ExitCode
+```
+
+|                    | 不带 BOM | 带 BOM |
+| ------------------ | -------- | ------ |
+| `Test-Path`        | `False`  | `True` |
+| node 退出码        | 1        | 0      |
+| `main.js` 是否运行 | 否       | 是     |
+
+不带 BOM 时，node 的报错是 `Error: Cannot find module '…\鏁版嵁鐩綍\main.js'`，脚本把目录名读错了。
+
+第二份脚本是一句以全角冒号结尾的中文提示：
+
+```powershell
+$message = '无法启动 node：'
+$message
+```
+
+带 BOM 时正常输出「无法启动 node：」。不带 BOM 时直接报语法错误，脚本以 1 退出：
+
+```text
+所在位置 …\message-nobom.ps1:1 字符: 12
++ $message = '鏃犳硶鍚鍔 node锛?
++            ~~~~~~~~~~~~~~
+字符串缺少终止符: '。
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : TerminatorExpectedAtEndOfString
+```
+
+两份不带 BOM 的脚本交给 PowerShell 7.6.6 运行，结果都正常。
+
+## 排查与原因
+
+### Windows PowerShell 5.1 按 ANSI 代码页读没有 BOM 的脚本
+
+微软在 about_Character_Encoding 里写明：PowerShell 引擎从文件读取源代码时，没有 BOM 就使用 ANSI 编码；脚本里要用非 ASCII 字符，就要存成带 BOM 的 UTF-8，否则 Windows PowerShell 会把脚本当成旧的 ANSI 代码页来解释。ANSI 代码页是系统给不支持 Unicode 的程序准备的编码，简体中文系统是 936，也就是 GBK。PowerShell 6 起默认按不带 BOM 的 UTF-8 读取，所以同一份脚本在 PowerShell 7 里没有问题。
+
+Node 的 `fs.writeFileSync(file, text, "utf8")` 不写 BOM。「数据目录」的 UTF-8 编码是 12 个字节 `e6 95 b0 e6 8d ae e7 9b ae e5 bd 95`，按 GBK 两个字节一组，读成了 6 个字「鏁版嵁鐩綍」，其中一个落在 GBK 的自定义区，显示不出来。脚本里的字符串已经变了，后面用到它的路径全都指向一个不存在的目录。
+
+### 字节数是奇数时，结束引号会被吞掉
+
+GBK 的中文字符占两个字节，UTF-8 的中文字符和全角标点占三个字节，两两配对时可能多出一个字节。全角冒号「：」的 UTF-8 编码是 `ef bc 9a`，按 GBK 读时，`ef bc` 变成「锛」；剩下的 `9a` 是 GBK 双字节字符的前半个，它把紧跟着的单引号 `27` 当成后半个，两个字节一起读成了一个问号。用 .NET 的 936 编码把第二份脚本那一行解一遍：
+
+```text
+UTF-8: 24 6d 65 73 73 61 67 65 20 3d 20 27 e6 97 a0 e6 b3 95 e5 90 af e5 8a a8 20 6e 6f 64 65 ef bc 9a 27
+GBK:   $message = '鏃犳硶鍚鍔 node锛?
+```
+
+结束引号没了，PowerShell 找不到字符串的结尾，报「字符串缺少终止符」。路径读错要等运行到那一行才暴露；语法错误则让整个脚本一行都不执行。
+
+### Start-Process 失败时，脚本照样以 0 退出
+
+启动脚本最后一行是 `exit $p.ExitCode`。Start-Process 自身失败时，例如 `-FilePath` 指向的程序因为路径被读错而找不到，PowerShell 只在错误流里留一条记录，`$p` 是 `$null`，`exit $null` 等于以 0 退出。在不带 BOM 的脚本里用 Start-Process 启动中文目录下的程序，PowerShell 报出下面的错误，脚本的退出码却是 0：
+
+```text
+Start-Process : 由于出现以下错误，无法运行此命令: 系统找不到指定的文件。。
+```
+
+计划任务按退出码记录运行结果，0 会被记成成功。窗口又是隐藏的，这条错误没有人看得到。
+
+## 解决办法
+
+### 启动脚本写成带 BOM 的 UTF-8
+
+```ts
+writeFileAtomic(
+  wrapperPath,
+  `﻿${buildWrapperScript({ nodePath, entryPath, homePath })}`,
+);
+```
+
+`﻿` 按 UTF-8 写出就是 `EF BB BF`。微软的同一篇文档也提醒，带 BOM 的文件可能让 `cat`、`sed`、`awk` 等类 Unix 工具出问题，所以 LeafPress 只给交给 Windows PowerShell 5.1 运行的脚本加 BOM，自己写的日志仍是不带 BOM 的 UTF-8。
+
+### Start-Process 失败时主动以 1 退出
+
+启动脚本改成下面的结构（路径换成了变量，便于阅读）：
+
+```powershell
+$process = $null
+$failure = $null
+try {
+  New-Item -ItemType Directory -Force -Path $logsPath | Out-Null
+  $process = Start-Process -FilePath $nodePath -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru `
+    -RedirectStandardOutput $stdoutPath -RedirectStandardError $errorLog -ErrorAction Stop
+} catch {
+  $failure = $_.Exception.Message
+}
+if ($null -eq $failure -and $null -eq $process) { $failure = 'Start-Process 没有返回进程对象' }
+if ($null -eq $failure -and $null -eq $process.ExitCode) { $failure = '拿不到 node 的退出码' }
+if ($null -ne $failure) {
+  try { [IO.File]::WriteAllText($errorLog, '无法启动 node（' + $nodePath + '）：' + $failure, (New-Object Text.UTF8Encoding($false))) } catch { }
+  exit 1
+}
+exit $process.ExitCode
+```
+
+`-ErrorAction Stop` 把 Start-Process 的错误变成可以 `catch` 的异常。启动失败时先把原因写进错误日志，再以 1 退出，计划任务就会记成失败。
+
+生成脚本时，路径通常写成 PowerShell 的单引号字符串，里面的 `'` 要写成两个。PowerShell 还把中文输入法常打出的弯单引号 `‘`、`’` 当成单引号，路径里出现 `’` 时，字符串会提前结束，报「表达式或语句中包含意外的标记」，这些字符也要同样写两遍。
+
+## 验证结果
+
+- 两份脚本的对照见「问题详情」：带 BOM 后，`Test-Path` 为 `True`，node 退出码为 0，中文提示原样输出。
+- LeafPress 的测试检查生成的启动脚本以 `EF BB BF` 开头。
+- 在真实的任务计划程序里注册一个 node 路径不存在的测试任务并手动运行一次：上次运行结果记为 1，错误日志里写着「无法启动 node（…\definitely-missing\node.exe）：由于出现以下错误，无法运行此命令: 系统找不到指定的文件。。」。
+
+以上结果来自 Windows PowerShell 5.1.26100 和 PowerShell 7.6.6，系统 ANSI 代码页为 936。
+
+## 参考资料
+
+- [Microsoft Learn：about_Character_Encoding（Windows PowerShell 5.1）](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_character_encoding?view=powershell-5.1)：没有 BOM 的脚本按 ANSI 代码页读取，含非 ASCII 字符的脚本应存成带 BOM 的 UTF-8
+- [Microsoft Learn：about_Quoting_Rules（Windows PowerShell 5.1）](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_quoting_rules?view=powershell-5.1)：弯引号按普通引号处理
