@@ -1,0 +1,148 @@
+---
+title: "Git Bash 的 curl 发中文 JSON 变成乱码的解决办法"
+description: "Windows 上 Git Bash 自带的 curl 没有开启 Unicode 支持，-d 里的中文会按 GBK 发出；Node 服务用 request.json() 读取时把非法字节换成 U+FFFD，乱码直接入库。服务端改成严格按 UTF-8 解码、不合法就返回 400，客户端改从 UTF-8 文件或标准输入发送请求体。"
+published: "2026-10-10"
+locale: "zh-CN"
+tags:
+  - "postmortem"
+  - "Windows"
+  - "Node.js"
+draft: false
+pinned: false
+translationKey: "git-bash-curl-chinese-json-mojibake"
+---
+
+在 Windows 的 Git Bash 里用 curl 向本机 Node 服务提交一段中文 JSON，接口返回成功，存下来的文字却是 `�����ˣ�û���⡣…`。Git for Windows 自带的 curl 没有开启 Unicode 支持，命令行参数里的中文按系统代码页 936（GBK）发出；服务端用 `request.json()` 读取请求体，按 UTF-8 解码时把认不出的字节换成替换字符 U+FFFD，原文就此丢失。服务端改成严格解码，不是 UTF-8 就返回 400；客户端改从 UTF-8 文件或标准输入发送请求体。
+
+## 问题详情
+
+LeafPress 的本机服务有一个提交反馈的接口，网页和命令行都通过它写入中文。端到端验收时，在 Git Bash 里用 curl 提交了一条反馈（链接已换成示例地址）：
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  http://127.0.0.1:3221/api/works/z-1/feedback \
+  -d '{"text":"看过了，没问题。发布了，链接是 https://example.com/p/1"}'
+```
+
+接口返回 `{"ok":true,...}`，读回来的反馈却是：
+
+```text
+�����ˣ�û���⡣�����ˣ������� https://example.com/p/1
+```
+
+链接完好，中文全坏了。把存下的前 12 个字节按十六进制打出来是 `ef bf bd ef bf bd ef bf bd ef bf bd`，即 4 个 U+FFFD 替换字符，原来的字节没有进库。同一个接口从浏览器提交中文一切正常。
+
+## 排查与原因
+
+### 换一种发送方式，中文就正常了
+
+为了看清 curl 实际发出了哪些字节，起了一个只打印请求体十六进制的 Node 服务，用三种方式发送 `{"text":"测试中文"}`：
+
+| 发送方式                                                 | 「测试中文」对应的字节                 |
+| -------------------------------------------------------- | -------------------------------------- |
+| Git Bash 里的 `curl`，`-d` 直接写中文                    | `b2e2 cad4 d6d0 cec4`（GBK）           |
+| `C:\Windows\System32\curl.exe`，同样的 `-d`              | `e6b58b e8af95 e4b8ad e69687`（UTF-8） |
+| Git Bash 里的 `curl`，`--data-binary @body.json` 或 `@-` | `e6b58b e8af95 e4b8ad e69687`（UTF-8） |
+
+请求体从文件或标准输入读取时，字节是 `printf` 写出的 UTF-8；只有经过命令行参数的那一种变成了 GBK。
+
+### Git Bash 里的 curl 没开 Unicode 支持
+
+Git Bash 里的 `curl` 是 Git for Windows 自带的 `C:\Program Files\Git\mingw64\bin\curl.exe`，在 PATH 里排在系统自带的 curl 前面。两个 curl 都是 8.21.0，`curl -V` 的功能列表差了一项 `Unicode`：
+
+```text
+# Git for Windows 自带
+Features: alt-svc AsynchDNS brotli HSTS HTTPS-proxy IDN IPv6 Kerberos Largefile libz NTLM PSL SPNEGO SSL SSPI threadsafe UnixSockets zstd
+
+# C:\Windows\System32\curl.exe
+Features: alt-svc AsynchDNS HSTS HTTPS-proxy IDN IPv6 Kerberos Largefile libz SPNEGO SSL SSPI threadsafe Unicode UnixSockets
+```
+
+curl 文档对 `Unicode` 这一项的解释是「Unicode support on Windows」。没有这项支持的 Windows 程序，收到的命令行参数会先被转换成系统当前的 ANSI 代码页，也就是系统给不支持 Unicode 的程序准备的那套编码。这台机器的 ANSI 代码页是 936，「测试中文」就变成了 GBK 的 `b2e2 cad4 d6d0 cec4`。
+
+在 PowerShell 7 里直接运行 `curl.exe`，找到的是系统自带的那个，不受影响。
+
+### 服务端为什么没有报错
+
+服务端原来用 `await request.json()` 解析请求体。按 Fetch 标准，`json()` 先对字节执行「UTF-8 decode」；Encoding 标准规定，这一步遇到非法字节时换成 U+FFFD 继续往下走，不报错，也不看 `Content-Type` 里的 `charset`。GBK 编码的中文大多不是合法的 UTF-8，解码后变成一串 U+FFFD，JSON 照样能解析，接口照样返回成功。
+
+乱码里夹着的 `ˣ`、`û`、`⡣` 也来自这次误解码：GBK 字节偶尔能凑成合法的 UTF-8 序列，就会被解成真实字符。以「了，」为例，它的 GBK 编码是 `c1 cb a3 ac`。`c1` 在 UTF-8 里永远不合法，变成 U+FFFD；`cb a3` 恰好是 U+02E3（ˣ）；`ac` 又变成 U+FFFD。U+FFFD 和这类零散符号混在一起，基本可以判断是 GBK 文本被当成 UTF-8 解码了。
+
+## 解决办法
+
+### 服务端：严格按 UTF-8 解码，不合法就拒收
+
+```ts
+export async function parseJson<S extends ZodType>(
+  request: Request,
+  schema: S,
+): Promise<output<S> | Response> {
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await request.arrayBuffer();
+  } catch {
+    return apiFailure(400, "USAGE", "请求体不是有效的 JSON。");
+  }
+
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return apiFailure(400, "USAGE", "请求体不是 UTF-8 编码");
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return apiFailure(400, "USAGE", "请求体不是有效的 JSON。");
+  }
+  // 接下来按 schema 校验字段
+}
+```
+
+`fatal: true` 让 `TextDecoder` 遇到非法字节时抛出 `TypeError`。接口返回 400 并说明原因，坏数据进不了库，调用方当场就知道请求有问题。
+
+### 客户端：从 UTF-8 文件或标准输入发送请求体
+
+在 Git Bash 里，把请求体写进 UTF-8 文件，或者从管道传入，再用 `--data-binary` 原样发送，中文就不经过命令行参数：
+
+```bash
+printf '%s' '{"text":"测试中文","source":"quick"}' > body.json
+curl -X POST -H "Content-Type: application/json" \
+  --data-binary @body.json http://127.0.0.1:3221/api/ideas
+
+printf '%s' '{"text":"测试中文","source":"quick"}' |
+  curl -X POST -H "Content-Type: application/json" \
+    --data-binary @- http://127.0.0.1:3221/api/ideas
+```
+
+也可以在 Git Bash 里写全路径 `/c/Windows/System32/curl.exe`，换用系统自带的 curl。
+
+PowerShell 也实测了一遍。PowerShell 7.6 里的 `curl.exe` 和 `Invoke-RestMethod` 发出的都是 UTF-8。Windows PowerShell 5.1 的 `Invoke-RestMethod` 在 `-ContentType` 不带 `charset` 时，中文变成了问号（`3f`）；写成 `application/json; charset=utf-8` 后才是 UTF-8。
+
+## 验证结果
+
+修复后，用临时数据目录启动 LeafPress 本机服务，在 Git Bash 里向新建灵感的接口各发一次，`-w` 附上状态码：
+
+```text
+# -d 直接写中文
+{"ok":false,"error":{"code":"USAGE","message":"请求体不是 UTF-8 编码"}} HTTP 400
+
+# --data-binary @idea.json（UTF-8 文件）
+{"ok":true,...,"idea":{"id":"i-1","text":"测试中文",...}} HTTP 200
+```
+
+单元测试也覆盖了这种情况：请求体里放 GBK 编码的「中文」（`d6 d0 ce c4`），接口返回 400 和同样的错误信息。
+
+严格解码只能拦下不合法的 UTF-8。Windows PowerShell 5.1 发出的问号本身是合法字符，服务端无法分辨；很短的 GBK 文本也可能碰巧全部是合法的 UTF-8 序列。客户端按 UTF-8 发送仍然是前提。
+
+## 参考资料
+
+- [curl 文档：-V, --version](https://curl.se/docs/manpage.html#-V)：功能列表中 `Unicode` 一项的含义
+- [curl 文档：--data-binary](https://curl.se/docs/manpage.html#--data-binary)
+- [Fetch Standard：Body 的 json() 方法](https://fetch.spec.whatwg.org/#dom-body-json)
+- [Encoding Standard：UTF-8 decode](https://encoding.spec.whatwg.org/#utf-8-decode)
+- [Node.js 文档：util.TextDecoder](https://nodejs.org/api/util.html#class-utiltextdecoder)
+- [Microsoft Learn：Invoke-RestMethod（Windows PowerShell 5.1）](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/invoke-restmethod?view=powershell-5.1)：`-ContentType` 里的 `charset` 决定请求体的编码
+- [Microsoft Learn：What's New in PowerShell 7.4](https://learn.microsoft.com/en-us/powershell/scripting/whats-new/what-s-new-in-powershell-74)：Web cmdlets 的默认字符集改为 UTF-8

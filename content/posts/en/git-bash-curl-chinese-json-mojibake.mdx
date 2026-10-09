@@ -1,0 +1,148 @@
+---
+title: "Fixing Garbled Chinese JSON Sent by curl from Git Bash"
+description: "Git for Windows ships a curl without Unicode support, so Chinese text in -d goes out as GBK and request.json() silently turns it into U+FFFD. Decode strictly as UTF-8, return 400, and send bodies from a UTF-8 file or stdin."
+published: "2026-10-10"
+locale: "en"
+tags:
+  - "postmortem"
+  - "Windows"
+  - "Node.js"
+draft: false
+pinned: false
+translationKey: "git-bash-curl-chinese-json-mojibake"
+---
+
+A Chinese JSON body sent with curl from Git Bash on Windows to a local Node.js service was accepted with a success response, yet the stored text read `�����ˣ�û���⡣…`. The curl bundled with Git for Windows is built without Unicode support, so the Chinese characters in its command-line arguments went out in the system code page 936 (GBK). The service parsed the body with `request.json()`, whose UTF-8 decoding replaces unrecognized bytes with U+FFFD, and the original text was lost. The service now decodes strictly and rejects anything that is not UTF-8 with a 400, and clients send the body from a UTF-8 file or standard input.
+
+## Problem details
+
+The LeafPress local service has an endpoint for submitting feedback, and both the web page and the command line write Chinese text through it. During end-to-end acceptance, a piece of feedback was submitted with curl from Git Bash (the link is replaced with an example address):
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  http://127.0.0.1:3221/api/works/z-1/feedback \
+  -d '{"text":"看过了，没问题。发布了，链接是 https://example.com/p/1"}'
+```
+
+The endpoint returned `{"ok":true,...}`, but the feedback read back was:
+
+```text
+�����ˣ�û���⡣�����ˣ������� https://example.com/p/1
+```
+
+The link survived and every Chinese character was broken. The first 12 stored bytes in hex were `ef bf bd ef bf bd ef bf bd ef bf bd`, four U+FFFD replacement characters, so the original bytes never reached the database. Submitting Chinese text to the same endpoint from a browser worked normally.
+
+## Investigation and cause
+
+### A different sending method fixes the text
+
+To see the bytes curl actually sent, a small Node service printed each request body in hex. `{"text":"测试中文"}` was sent three ways:
+
+| Sending method                                             | Bytes for "测试中文"                  |
+| ---------------------------------------------------------- | ------------------------------------- |
+| `curl` in Git Bash with the Chinese text in `-d`           | `b2e2 cad4 d6d0 cec4` (GBK)           |
+| `C:\Windows\System32\curl.exe` with the same `-d`          | `e6b58b e8af95 e4b8ad e69687` (UTF-8) |
+| `curl` in Git Bash with `--data-binary @body.json` or `@-` | `e6b58b e8af95 e4b8ad e69687` (UTF-8) |
+
+When the body came from a file or standard input, the bytes were the UTF-8 that `printf` wrote. Only the path through command-line arguments turned into GBK.
+
+### The curl in Git Bash has no Unicode support
+
+The `curl` in Git Bash is `C:\Program Files\Git\mingw64\bin\curl.exe`, bundled with Git for Windows, and it comes before the system curl on PATH. Both are curl 8.21.0, and their `curl -V` feature lists differ by one entry, `Unicode`:
+
+```text
+# Bundled with Git for Windows
+Features: alt-svc AsynchDNS brotli HSTS HTTPS-proxy IDN IPv6 Kerberos Largefile libz NTLM PSL SPNEGO SSL SSPI threadsafe UnixSockets zstd
+
+# C:\Windows\System32\curl.exe
+Features: alt-svc AsynchDNS HSTS HTTPS-proxy IDN IPv6 Kerberos Largefile libz SPNEGO SSL SSPI threadsafe Unicode UnixSockets
+```
+
+The curl documentation describes the `Unicode` feature as "Unicode support on Windows". A Windows program built without it receives its command-line arguments converted to the system's current ANSI code page, the legacy encoding Windows keeps for programs that do not use Unicode. This machine's ANSI code page is 936, so "测试中文" became the GBK bytes `b2e2 cad4 d6d0 cec4`.
+
+Running `curl.exe` in PowerShell 7 finds the system copy, which is not affected.
+
+### Why the service did not fail
+
+The service originally parsed the body with `await request.json()`. Under the Fetch Standard, `json()` first runs "UTF-8 decode" on the bytes, and the Encoding Standard has that step replace invalid bytes with U+FFFD and carry on. It raises no error and ignores any `charset` in `Content-Type`. GBK-encoded Chinese is mostly invalid UTF-8, so it decodes to a run of U+FFFD, the JSON still parses, and the endpoint still reports success.
+
+The stray `ˣ`, `û`, and `⡣` in the garbled text come from the same misdecoding. Occasionally GBK bytes happen to form a valid UTF-8 sequence and decode to a real character. Take "了，", whose GBK encoding is `c1 cb a3 ac`. `c1` is never valid in UTF-8 and becomes U+FFFD, `cb a3` happens to be U+02E3 (ˣ), and `ac` becomes U+FFFD again. U+FFFD mixed with scattered symbols like these is a reliable sign that GBK text was decoded as UTF-8.
+
+## Solution
+
+### Server: decode strictly as UTF-8 and reject anything else
+
+```ts
+export async function parseJson<S extends ZodType>(
+  request: Request,
+  schema: S,
+): Promise<output<S> | Response> {
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await request.arrayBuffer();
+  } catch {
+    return apiFailure(400, "USAGE", "请求体不是有效的 JSON。");
+  }
+
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return apiFailure(400, "USAGE", "请求体不是 UTF-8 编码");
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return apiFailure(400, "USAGE", "请求体不是有效的 JSON。");
+  }
+  // Validate the fields against the schema next
+}
+```
+
+With `fatal: true`, `TextDecoder` throws a `TypeError` on invalid bytes. The endpoint returns a 400 that says the body is not UTF-8, bad data never reaches the database, and the caller learns about the problem immediately.
+
+### Client: send the body from a UTF-8 file or standard input
+
+In Git Bash, write the body to a UTF-8 file or pipe it in, and let `--data-binary` send it unchanged, so the Chinese text never passes through command-line arguments:
+
+```bash
+printf '%s' '{"text":"测试中文","source":"quick"}' > body.json
+curl -X POST -H "Content-Type: application/json" \
+  --data-binary @body.json http://127.0.0.1:3221/api/ideas
+
+printf '%s' '{"text":"测试中文","source":"quick"}' |
+  curl -X POST -H "Content-Type: application/json" \
+    --data-binary @- http://127.0.0.1:3221/api/ideas
+```
+
+Another option in Git Bash is to call the system curl by its full path, `/c/Windows/System32/curl.exe`.
+
+PowerShell was tested as well. In PowerShell 7.6, both `curl.exe` and `Invoke-RestMethod` sent UTF-8. In Windows PowerShell 5.1, `Invoke-RestMethod` turned the Chinese text into question marks (`3f`) when `-ContentType` had no `charset`, and sent UTF-8 only with `application/json; charset=utf-8`.
+
+## Verification results
+
+After the fix, the LeafPress local service was started with a temporary data directory, and Git Bash sent one request each way to the endpoint that creates an idea, with `-w` appending the status code:
+
+```text
+# Chinese text directly in -d
+{"ok":false,"error":{"code":"USAGE","message":"请求体不是 UTF-8 编码"}} HTTP 400
+
+# --data-binary @idea.json (a UTF-8 file)
+{"ok":true,...,"idea":{"id":"i-1","text":"测试中文",...}} HTTP 200
+```
+
+The error message means "the request body is not UTF-8 encoded". A unit test covers the same case: a body containing the GBK bytes for "中文" (`d6 d0 ce c4`) gets a 400 with that message.
+
+Strict decoding only catches invalid UTF-8. The question marks sent by Windows PowerShell 5.1 are valid characters, and the server cannot tell them apart from real input. A very short GBK string can also happen to be entirely valid UTF-8. Clients still have to send UTF-8.
+
+## References
+
+- [curl documentation: -V, --version](https://curl.se/docs/manpage.html#-V): the meaning of the `Unicode` feature
+- [curl documentation: --data-binary](https://curl.se/docs/manpage.html#--data-binary)
+- [Fetch Standard: the json() method of Body](https://fetch.spec.whatwg.org/#dom-body-json)
+- [Encoding Standard: UTF-8 decode](https://encoding.spec.whatwg.org/#utf-8-decode)
+- [Node.js documentation: util.TextDecoder](https://nodejs.org/api/util.html#class-utiltextdecoder)
+- [Microsoft Learn: Invoke-RestMethod (Windows PowerShell 5.1)](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/invoke-restmethod?view=powershell-5.1): the `charset` in `-ContentType` determines the body encoding
+- [Microsoft Learn: What's New in PowerShell 7.4](https://learn.microsoft.com/en-us/powershell/scripting/whats-new/what-s-new-in-powershell-74): web cmdlets default to UTF-8
