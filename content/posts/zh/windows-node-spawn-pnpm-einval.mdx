@@ -1,0 +1,182 @@
+---
+title: "Windows 上用 Node 启动 pnpm 报 spawn EINVAL 的解决办法"
+description: "Node 24 在 Windows 上不经 shell 启动 pnpm.cmd 会同步抛出 spawn EINVAL。改用 cmd.exe /d /s /c pnpm 启动可以解决；超时时还要用 taskkill /T 结束整个进程树，cmd.exe 输出的中文提示要按 GBK 解码。"
+published: "2026-10-10"
+locale: "zh-CN"
+tags:
+  - "postmortem"
+  - "Windows"
+  - "Node.js"
+draft: false
+pinned: false
+translationKey: "windows-node-spawn-pnpm-einval"
+---
+
+在 Windows 上用 Node 的 `execFile` 启动 npm 全局安装的 pnpm，调用当场抛出 `Error: spawn EINVAL`，回调一次都没有执行。npm 装出来的 pnpm 是一个 `pnpm.cmd` 批处理文件，而 Node 从 2024 年 4 月的安全更新起，拒绝在不经过 shell 的情况下直接启动 `.bat` 和 `.cmd` 文件。改用 `cmd.exe /d /s /c pnpm …` 启动后可以正常运行，但超时只能结束外层的 cmd.exe，找不到 pnpm 时的中文提示也是 GBK 编码，这两处需要另外处理。
+
+## 问题详情
+
+LeafPress 是一个在本机运行的 Node 命令行工具，发布博客文章前要在博客仓库里依次运行 `pnpm content:check`、`pnpm format:check` 和 `pnpm build`。设计阶段在本机试跑了启动 pnpm 的代码，环境是 Windows 11（10.0.26100）和 Node.js v24.18.0，pnpm 用 npm 全局安装：
+
+```js
+const { execFile } = require("node:child_process");
+
+execFile("pnpm.cmd", ["--version"], (error, stdout) => {
+  console.log(error ?? stdout);
+});
+```
+
+预期打印 pnpm 的版本号，实际进程直接崩溃：
+
+```text
+Error: spawn EINVAL
+    at ChildProcess.spawn (node:internal/child_process:441:11)
+    at spawn (node:child_process:796:9)
+    at execFile (node:child_process:349:17)
+    ...
+  errno: -4071,
+  code: 'EINVAL',
+  syscall: 'spawn'
+}
+```
+
+这个错误在调用 `execFile` 时同步抛出，回调没有机会处理。调用处没有包 `try/catch` 的话，整个 Node 进程会退出。
+
+npm 在 `%APPDATA%\npm` 下为 pnpm 生成了 `pnpm`、`pnpm.cmd`、`pnpm.ps1` 三个启动脚本，没有 `pnpm.exe`。只写 `pnpm` 不带后缀时，`spawn` 报的是 `ENOENT`，Node 不会去找 `pnpm.cmd`。
+
+## 排查与原因
+
+### Node 不再直接启动 .bat 和 .cmd
+
+Node.js 在 2024 年 4 月的安全更新里修复了 CVE-2024-27980。`.bat`、`.cmd` 文件由 cmd.exe 解释执行，cmd.exe 解析命令行的规则和普通程序不同，即使没有打开 `shell` 选项，精心构造的参数也能借这一步注入命令。修复方式是直接禁止：不带 `shell` 选项把 `.bat` 或 `.cmd` 交给 `spawn`、`spawnSync`，一律报 `EINVAL`。这次更新覆盖当时的 18.x、20.x、21.x，本文用的 Node 24 同样如此。`execFile` 内部调用的也是 `spawn`，调用栈里能看到这一层。
+
+### 公告里的绕法在 Node 24 上会告警
+
+安全公告给出的绕法是：确认输入安全后，加上 `{ shell: true }`。这样确实能运行，但 Node 24 会输出一条弃用警告：
+
+```text
+[DEP0190] DeprecationWarning: Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.
+```
+
+DEP0190 从 Node 24.0.0 起是运行时弃用，代码一用到这种写法就会打出上面的警告。打开 `shell` 后，参数数组只是用空格拼成一条命令交给 shell，不做转义，参数里的 `&`、`|` 会被 cmd.exe 当成命令分隔符。
+
+Node 文档列出的另一种做法，是自己启动 cmd.exe，把 `.cmd` 文件作为参数交给它，`exec()` 内部做的也是这件事。
+
+## 解决办法
+
+### 用 cmd.exe /d /s /c 启动 pnpm
+
+```ts
+export function pnpmInvocation(
+  platform: NodeJS.Platform,
+  args: readonly string[],
+): { command: string; args: string[] } {
+  if (platform === "win32")
+    return { command: "cmd.exe", args: ["/d", "/s", "/c", "pnpm", ...args] };
+  return { command: "pnpm", args: [...args] };
+}
+```
+
+按微软的 cmd 文档，三个开关的作用是：
+
+- `/d`：不执行注册表里配置的 AutoRun 命令，避免机器上的自定义启动命令混进来；
+- `/c`：执行后面的命令，然后退出；
+- `/s`：和 `/c` 一起用时，只去掉命令首尾的一对引号，其余内容原样保留。
+
+cmd.exe 会重新解析整条命令行，所以参数里只放代码里写死的脚本名和程序自己生成的路径，不拼接用户输入。工作目录通过 `cwd` 选项传入，不出现在命令行里。用一个打印工作目录和参数的假 `pnpm.cmd` 试过带空格、`&`、`%`、`^`、括号和中文的目录名，工作目录和参数都原样传到了 pnpm。
+
+### 超时时结束整个进程树
+
+换成 cmd.exe 之后，进程链变成 cmd.exe → pnpm（node）→ 构建脚本（node）。`execFile` 的 `timeout` 到点只结束它直接启动的 cmd.exe。Windows 结束一个进程时不会顺带结束它启动的子进程，pnpm 和构建会继续运行，继续占用文件和 CPU。
+
+本机复现：用 `cmd.exe /d /s /c node hang.js` 启动一个一直挂起的 node 进程，`timeout` 设为 3 秒。3034 毫秒后回调收到 `killed: true`、`signal: 'SIGTERM'`；两秒后再查，里面那个 node 进程（进程号 82712）仍在运行。
+
+改法是用 `spawn` 启动、自己计时，到点用 `taskkill /T /F /PID <cmd.exe 的进程号>` 结束整棵进程树。`/T` 表示连同它启动的子进程一起结束，`/F` 表示强制结束：
+
+```ts
+function killProcessTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid === undefined) {
+    child.kill("SIGKILL");
+    return;
+  }
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/T", "/F", "/PID", String(pid)], {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    killer.once("error", () => {
+      child.kill("SIGKILL");
+    });
+    killer.unref();
+    return;
+  }
+  // 其他系统在启动时设置了 detached: true，子进程自成一个进程组，这里整组结束
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
+}
+```
+
+### 先确认 pnpm 存在，输出按 GBK 兜底解码
+
+借 cmd.exe 启动还有一个副作用：PATH 里没有 pnpm 时，cmd.exe 本身照样启动成功，`spawn` 不会报 `ENOENT`。失败只表现为退出码 1 和 cmd.exe 打出的一句提示。检查脚本失败时 pnpm 通常也以 1 退出，只看退出码，分不清是没装 pnpm 还是检查没通过。
+
+这句提示按系统代码页输出，中文系统是 936，也就是 GBK。直接按 UTF-8 解码得到的是乱码：
+
+```text
+'pnpmx' �����ڲ����ⲿ���Ҳ���ǿ����еĳ���
+���������ļ���
+```
+
+按 GB18030（GBK 的超集）解码才是原文：
+
+```text
+'pnpmx' 不是内部或外部命令，也不是可运行的程序
+或批处理文件。
+```
+
+LeafPress 分两步处理。第一次启动 pnpm 之前，先运行 `cmd.exe /d /s /c "where pnpm"`：找到时退出码为 0；找不到时退出码为 1，并提示「信息: 用提供的模式无法找到文件。」，这时直接报「找不到 pnpm」。所有子进程的输出先按 UTF-8 严格解码，不是合法的 UTF-8 再按 GB18030 解码：
+
+```ts
+export function decodeOutput(bytes: Uint8Array): string {
+  if (bytes.length === 0) return "";
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      bytes,
+    );
+  } catch {
+    return new TextDecoder("gb18030").decode(bytes);
+  }
+}
+```
+
+`fatal: true` 让解码器遇到非法字节时抛出 `TypeError`，不会悄悄换成替换字符 U+FFFD，兜底分支才有机会执行。Node 官方构建默认带完整的 ICU 数据，`TextDecoder` 能直接解 GB18030。
+
+## 验证结果
+
+2026 年 10 月 10 日在同一台机器上（Node.js v24.18.0，pnpm 10.34.5）重跑了几种启动方式：
+
+| 启动方式                                                       | 结果                                  |
+| -------------------------------------------------------------- | ------------------------------------- |
+| `execFile("pnpm.cmd", ["--version"])`                          | 同步抛出 `spawn EINVAL`               |
+| `spawn("pnpm", ["--version"])`                                 | `ENOENT`                              |
+| `execFile("pnpm", ["--version"], { shell: true })`             | 输出 `10.34.5`，同时打出 DEP0190 警告 |
+| `execFile("cmd.exe", ["/d", "/s", "/c", "pnpm", "--version"])` | 输出 `10.34.5`                        |
+
+结束进程树的效果单独验证过：用假的 `pnpm.cmd` 搭出五层进程（pnpm → cmd → node → cmd → node，最里层一直挂起），超时后调用在 4786 毫秒时返回，五个进程全部结束。
+
+LeafPress 随后按这套方式在博客仓库的检出目录里跑完了三项检查：内容检查 10.7 秒，格式检查 16.5 秒，构建 241 秒。
+
+以上结论只在 Windows 11、Node 24 和 npm 生成的 `pnpm.cmd` 上验证过。如果启动的是 `.exe` 文件，不受 `.bat`、`.cmd` 这条限制。
+
+## 参考资料
+
+- [Node.js: Wednesday, April 10, 2024 Security Releases](https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2)：CVE-2024-27980，以及 `.bat`、`.cmd` 报 `EINVAL` 的说明
+- [Node.js 文档：Spawning .bat and .cmd files on Windows](https://nodejs.org/api/child_process.html#spawning-bat-and-cmd-files-on-windows)
+- [Node.js 文档：DEP0190](https://nodejs.org/api/deprecations.html#DEP0190)
+- [Microsoft Learn：cmd](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cmd)
+- [Microsoft Learn：taskkill](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/taskkill)
+- [Node.js 文档：TextDecoder 默认支持的编码](https://nodejs.org/api/util.html#encodings-supported-by-default-with-full-icu-data)

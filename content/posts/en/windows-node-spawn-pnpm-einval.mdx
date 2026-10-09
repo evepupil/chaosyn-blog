@@ -1,0 +1,182 @@
+---
+title: "Fixing spawn EINVAL When Node.js Starts pnpm on Windows"
+description: "On Windows, Node 24 throws spawn EINVAL synchronously when it starts pnpm.cmd without a shell. Launching pnpm through cmd.exe /d /s /c fixes it; timeouts must kill the whole tree with taskkill /T, and cmd.exe messages need GBK decoding."
+published: "2026-10-10"
+locale: "en"
+tags:
+  - "postmortem"
+  - "Windows"
+  - "Node.js"
+draft: false
+pinned: false
+translationKey: "windows-node-spawn-pnpm-einval"
+---
+
+Calling Node's `execFile` on Windows to start a globally installed pnpm threw `Error: spawn EINVAL` on the spot, and the callback never ran. npm installs pnpm as a `pnpm.cmd` batch file, and since the April 2024 security release Node refuses to launch `.bat` and `.cmd` files without a shell. Starting pnpm as `cmd.exe /d /s /c pnpm …` works, but a timeout then kills only the outer cmd.exe, and the "command not found" message arrives in GBK, so both need extra handling.
+
+## Problem details
+
+LeafPress is a Node.js command-line tool that runs locally. Before publishing a blog post, it runs `pnpm content:check`, `pnpm format:check`, and `pnpm build` in the blog repository. During design, the code that starts pnpm was tried on Windows 11 (10.0.26100) with Node.js v24.18.0 and a pnpm installed globally through npm:
+
+```js
+const { execFile } = require("node:child_process");
+
+execFile("pnpm.cmd", ["--version"], (error, stdout) => {
+  console.log(error ?? stdout);
+});
+```
+
+It should have printed pnpm's version. The process crashed instead:
+
+```text
+Error: spawn EINVAL
+    at ChildProcess.spawn (node:internal/child_process:441:11)
+    at spawn (node:child_process:796:9)
+    at execFile (node:child_process:349:17)
+    ...
+  errno: -4071,
+  code: 'EINVAL',
+  syscall: 'spawn'
+}
+```
+
+The error is thrown synchronously from the `execFile` call, so the callback never gets a chance to handle it. Without a `try/catch` around the call, the whole Node process exits.
+
+npm created three launchers for pnpm in `%APPDATA%\npm`: `pnpm`, `pnpm.cmd`, and `pnpm.ps1`. There is no `pnpm.exe`. Passing plain `pnpm` without an extension makes `spawn` fail with `ENOENT`, because Node does not look for `pnpm.cmd`.
+
+## Investigation and cause
+
+### Node no longer starts .bat and .cmd files directly
+
+The April 2024 Node.js security release fixed CVE-2024-27980. Windows runs `.bat` and `.cmd` files through cmd.exe, which parses command lines by different rules from ordinary programs, so crafted arguments could inject commands at that step even without the `shell` option. The fix is a blanket refusal: passing a `.bat` or `.cmd` file to `spawn` or `spawnSync` without the `shell` option now fails with `EINVAL`. The release covered the 18.x, 20.x, and 21.x lines of the time, and Node 24, used here, behaves the same way. `execFile` calls `spawn` internally, as the stack trace shows.
+
+### The advisory's workaround warns on Node 24
+
+The advisory says that once the input is sanitized, you can pass `{ shell: true }`. That does work, but Node 24 prints a deprecation warning:
+
+```text
+[DEP0190] DeprecationWarning: Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.
+```
+
+DEP0190 has been a runtime deprecation since Node 24.0.0, so the warning above appears whenever code uses this pattern. With `shell` enabled, the arguments array is joined with spaces into a single command for the shell without any escaping, so an `&` or `|` inside an argument becomes a command separator for cmd.exe.
+
+The other approach in the Node documentation is to start cmd.exe yourself and pass the `.cmd` file to it as an argument, which is also what `exec()` does internally.
+
+## Solution
+
+### Start pnpm with cmd.exe /d /s /c
+
+```ts
+export function pnpmInvocation(
+  platform: NodeJS.Platform,
+  args: readonly string[],
+): { command: string; args: string[] } {
+  if (platform === "win32")
+    return { command: "cmd.exe", args: ["/d", "/s", "/c", "pnpm", ...args] };
+  return { command: "pnpm", args: [...args] };
+}
+```
+
+According to Microsoft's cmd documentation, the three switches do the following:
+
+- `/d` disables AutoRun commands configured in the registry, so custom startup commands on the machine stay out of the way;
+- `/c` runs the command that follows and then exits;
+- `/s`, combined with `/c`, strips only the first and last quotes around the command and leaves the rest unchanged.
+
+cmd.exe parses the whole command line again, so the arguments contain only script names hard-coded in the program and paths the program generates itself, never user input. The working directory goes through the `cwd` option and never appears on the command line. A fake `pnpm.cmd` that prints its working directory and arguments was run from directory names containing spaces, `&`, `%`, `^`, parentheses, and Chinese characters, and both the directory and the arguments reached pnpm unchanged.
+
+### Kill the whole process tree on timeout
+
+With cmd.exe in front, the process chain becomes cmd.exe → pnpm (node) → build scripts (node). When the `timeout` of `execFile` fires, it kills only the cmd.exe it started. Terminating a process on Windows does not terminate the processes it started, so pnpm and the build keep running and keep holding files and CPU.
+
+Local reproduction: a node process that never exits was started through `cmd.exe /d /s /c node hang.js` with `timeout` set to 3 seconds. After 3034 ms the callback received `killed: true` and `signal: 'SIGTERM'`. Checked two seconds later, the inner node process (PID 82712) was still running.
+
+The fix is to start the child with `spawn`, keep a timer, and run `taskkill /T /F /PID <cmd.exe PID>` when it expires. `/T` ends the process together with the child processes it started, and `/F` forces termination:
+
+```ts
+function killProcessTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid === undefined) {
+    child.kill("SIGKILL");
+    return;
+  }
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/T", "/F", "/PID", String(pid)], {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    killer.once("error", () => {
+      child.kill("SIGKILL");
+    });
+    killer.unref();
+    return;
+  }
+  // Elsewhere the child was started with detached: true, so it leads its own process group
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
+}
+```
+
+### Detect a missing pnpm and fall back to GBK decoding
+
+Going through cmd.exe has one more side effect. When pnpm is not on PATH, cmd.exe itself still starts, so `spawn` reports no `ENOENT`. The failure shows up only as exit code 1 and a message printed by cmd.exe. A failing check script usually makes pnpm exit with 1 as well, so the exit code alone cannot tell a missing pnpm from a failed check.
+
+That message is written in the system code page, which is 936 (GBK) on Chinese Windows. Decoding it as UTF-8 produces garbage:
+
+```text
+'pnpmx' �����ڲ����ⲿ���Ҳ���ǿ����еĳ���
+���������ļ���
+```
+
+Decoding it as GB18030, a superset of GBK, recovers the original message, which says the name is not recognized as an internal or external command, operable program, or batch file:
+
+```text
+'pnpmx' 不是内部或外部命令，也不是可运行的程序
+或批处理文件。
+```
+
+LeafPress handles this in two steps. Before starting pnpm for the first time, it runs `cmd.exe /d /s /c "where pnpm"`. The exit code is 0 when pnpm is found. When it is not found, the exit code is 1 and `where` prints a message saying no files match the pattern, so LeafPress reports right away that pnpm cannot be found. All child process output is first decoded as strict UTF-8 and decoded as GB18030 only when it is not valid UTF-8:
+
+```ts
+export function decodeOutput(bytes: Uint8Array): string {
+  if (bytes.length === 0) return "";
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      bytes,
+    );
+  } catch {
+    return new TextDecoder("gb18030").decode(bytes);
+  }
+}
+```
+
+`fatal: true` makes the decoder throw a `TypeError` on invalid bytes instead of silently substituting U+FFFD, which is what gives the fallback branch a chance to run. Official Node.js builds include full ICU data, so `TextDecoder` can decode GB18030 directly.
+
+## Verification results
+
+On October 10, 2026, each launch method was rerun on the same machine (Node.js v24.18.0, pnpm 10.34.5):
+
+| Launch method                                                  | Result                                          |
+| -------------------------------------------------------------- | ----------------------------------------------- |
+| `execFile("pnpm.cmd", ["--version"])`                          | Throws `spawn EINVAL` synchronously             |
+| `spawn("pnpm", ["--version"])`                                 | `ENOENT`                                        |
+| `execFile("pnpm", ["--version"], { shell: true })`             | Prints `10.34.5` along with the DEP0190 warning |
+| `execFile("cmd.exe", ["/d", "/s", "/c", "pnpm", "--version"])` | Prints `10.34.5`                                |
+
+Killing the process tree was verified separately. A fake `pnpm.cmd` built a five-level chain (pnpm → cmd → node → cmd → node, with the innermost process hanging). After the timeout, the call returned at 4786 ms and all five processes were gone.
+
+LeafPress then used this approach to run all three checks in a checkout of the blog repository: the content check took 10.7 seconds, the format check 16.5 seconds, and the build 241 seconds.
+
+These results were verified only on Windows 11, Node 24, and the npm-generated `pnpm.cmd`. Starting an `.exe` file is not affected by the `.bat`/`.cmd` restriction.
+
+## References
+
+- [Node.js: Wednesday, April 10, 2024 Security Releases](https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2): CVE-2024-27980 and the `EINVAL` behavior for `.bat` and `.cmd` files
+- [Node.js documentation: Spawning .bat and .cmd files on Windows](https://nodejs.org/api/child_process.html#spawning-bat-and-cmd-files-on-windows)
+- [Node.js documentation: DEP0190](https://nodejs.org/api/deprecations.html#DEP0190)
+- [Microsoft Learn: cmd](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cmd)
+- [Microsoft Learn: taskkill](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/taskkill)
+- [Node.js documentation: Encodings supported by default (with full ICU data)](https://nodejs.org/api/util.html#encodings-supported-by-default-with-full-icu-data)
