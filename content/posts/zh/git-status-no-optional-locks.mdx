@@ -1,0 +1,101 @@
+---
+title: "只读检查里的 git status 会改写索引文件，加 --no-optional-locks 解决"
+description: "git status 发现文件修改时间变了，会顺手刷新并写回 .git/index，写的时候还要占用 index.lock。只读的后台检查这样做会改动用户的仓库，也可能让用户同时执行的 git add 失败。给这类调用加上 git --no-optional-locks 即可。"
+published: "2026-10-10"
+locale: "zh-CN"
+tags:
+  - "postmortem"
+  - "Git"
+draft: false
+pinned: false
+translationKey: "git-status-no-optional-locks"
+---
+
+LeafPress 第一版的体检命令要求只读，其中一项用 `git status --porcelain --untracked-files=no` 检查作者的博客仓库有没有未提交的改动。评审发现，这条命令会顺手改写博客仓库的 `.git/index`：工作区文件的修改时间变了，`git status` 会刷新索引里缓存的文件信息并写回磁盘，写的时候还要占用 `index.lock`。给 git 加上 `--no-optional-locks` 后，检查不再写索引。
+
+## 问题详情
+
+第一版的体检命令（`leafpress doctor`）要读博客仓库的状态，前提是不改动作者仓库里的任何文件。判断有没有未提交改动的命令是：
+
+```bash
+git status --porcelain --untracked-files=no
+```
+
+输出为空表示没有改动。评审指出这条命令会改写仓库的索引文件。下面在一个临时仓库里复现，环境是 Windows 上的 Git 2.55.0.windows.3：
+
+```bash
+git init -q
+for i in $(seq 1 50); do echo "post $i" > "post-$i.md"; done
+git add . && git commit -qm init
+sleep 1.2 && touch post-*.md   # 只改修改时间，不改内容
+
+git --no-optional-locks status --porcelain --untracked-files=no
+git status --porcelain --untracked-files=no
+```
+
+每一步之后记录 `.git/index` 的 sha256 前 12 位和修改时间：
+
+| 时间点                                | 哈希           | 修改时间     |
+| ------------------------------------- | -------------- | ------------ |
+| `touch` 之后                          | `1bc306f8c624` | 23:44:49.999 |
+| `git --no-optional-locks status` 之后 | `1bc306f8c624` | 23:44:49.999 |
+| `git status` 之后                     | `d297347e84dd` | 23:44:51.932 |
+
+两次 `status` 都没有输出，仓库里没有任何改动，只有没加 `--no-optional-locks` 的那次改写了索引文件。
+
+## 排查与原因
+
+### git status 默认会刷新并写回索引
+
+索引文件 `.git/index` 为每个已跟踪的文件缓存了大小、修改时间等信息，git 靠它快速判断文件有没有变化。文件内容没变、修改时间变了（编辑器保存、格式化工具、`touch`、同步软件都会这样），`git status` 要重新读取文件内容才能确认；确认没变后，它把新的修改时间写回索引，下次就不用再读。
+
+git 文档的 BACKGROUND REFRESH 一节专门说明了这一点：写回索引只是一项优化，`status` 的结果不依赖它；在后台运行 `status` 时，写入期间持有的锁可能和同时运行的其他进程冲突，导致它们失败，后台脚本应当考虑使用 `git --no-optional-locks status`。
+
+### 写索引要占用 index.lock，会和作者的 git 命令冲突
+
+git 写索引时先创建 `.git/index.lock`，写完再替换原文件。另一个要改索引的 git 命令恰好在这时运行，会因为锁文件已经存在而失败。LeafPress 的体检可能由 agent 在作者工作时顺手运行，作者可能正在同一个仓库里 `git add`、`git commit`，正是文档描述的情况。
+
+用 3000 个文件的测试仓库模拟：后台循环执行「`touch` 三个文件，再 `git status`」，前台连续执行 150 次 `git add`，其中 4 次失败：
+
+```text
+fatal: Unable to create '…/.git/index.lock': File exists.
+
+Another git process seems to be running in this repository, or the lock file may be stale
+```
+
+后台循环改成 `git --no-optional-locks status` 后，150 次 `git add` 全部成功。两组各跑了一次，数字只说明冲突真实存在，不代表固定的失败率。
+
+## 解决办法
+
+当时 LeafPress 读取博客仓库状态的 git 命令都经过同一个函数，统一加上公共参数：
+
+```ts
+/** git 命令统一加的参数：--no-optional-locks 让 status 之类不写 .git/index（体检不改任何东西）；
+ *  core.quotepath=false 关掉路径的八进制转义，中文文件名才能原样显示 */
+export const GIT_BASE_ARGS = [
+  "--no-optional-locks",
+  "-c",
+  "core.quotepath=false",
+] as const;
+
+const result = await exec("git", [...GIT_BASE_ARGS, ...args], {
+  cwd: repoPath,
+});
+```
+
+`--no-optional-locks` 等同于设置环境变量 `GIT_OPTIONAL_LOCKS=0`：git 跳过所有需要加锁的可选操作，`status` 照常算出结果，只是不再写回索引。`core.quotepath=false` 和锁无关，git 默认把中文文件名转义成 `"\346\250\241…"` 这样的八进制，关掉后输出里是原本的文件名。
+
+这个参数只跳过「可选」的加锁操作。`git fetch`、`git commit` 这类本来就要写仓库的命令照常加锁，不能靠它变成只读。
+
+## 验证结果
+
+- 上面的复现里，加了 `--no-optional-locks` 的 `status` 前后，索引文件的哈希和修改时间都没有变化。
+- 当时 LeafPress 有一条用真实 git 仓库跑的测试：把 `README.md` 的修改时间往后拨 10 分钟，调用读取仓库状态的函数，前后 `.git/index` 的 sha256 一致。
+- 以上结果来自 Windows 上的 Git 2.55.0.windows.3。
+
+后来 LeafPress 改在自己的 git worktree 里跑检查，对作者仓库只做 fetch 和 worktree 登记，这段读取仓库状态的代码和测试随之删除。
+
+## 参考资料
+
+- [git-status 文档：BACKGROUND REFRESH](https://git-scm.com/docs/git-status#_background_refresh)
+- [git 文档：--no-optional-locks](https://git-scm.com/docs/git#Documentation/git.txt---no-optional-locks)：与 `GIT_OPTIONAL_LOCKS=0` 等价

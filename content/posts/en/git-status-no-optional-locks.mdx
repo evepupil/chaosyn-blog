@@ -1,0 +1,101 @@
+---
+title: "A Read-Only git status Rewrites the Index; --no-optional-locks Stops It"
+description: "When file timestamps change, git status writes a refreshed .git/index while holding index.lock, so a read-only background check modifies the repository and can make a concurrent git add fail. Use git --no-optional-locks."
+published: "2026-10-10"
+locale: "en"
+tags:
+  - "postmortem"
+  - "Git"
+draft: false
+pinned: false
+translationKey: "git-status-no-optional-locks"
+---
+
+The doctor command in the first version of LeafPress was meant to be read-only, and one of its checks ran `git status --porcelain --untracked-files=no` to see whether the author's blog repository had uncommitted changes. A review found that the command rewrote the blog repository's `.git/index` as a side effect. When working-tree files have new modification times, `git status` refreshes the file information cached in the index and writes it back to disk, holding `index.lock` while it writes. Adding `--no-optional-locks` to git stopped the check from writing the index.
+
+## Problem details
+
+The first version's doctor command (`leafpress doctor`) had to read the blog repository's state without changing any file in the author's repository. The command that detected uncommitted changes was:
+
+```bash
+git status --porcelain --untracked-files=no
+```
+
+Empty output meant no changes. The review pointed out that this command rewrites the repository's index file. The reproduction below uses a temporary repository with Git 2.55.0.windows.3 on Windows:
+
+```bash
+git init -q
+for i in $(seq 1 50); do echo "post $i" > "post-$i.md"; done
+git add . && git commit -qm init
+sleep 1.2 && touch post-*.md   # change modification times only, not content
+
+git --no-optional-locks status --porcelain --untracked-files=no
+git status --porcelain --untracked-files=no
+```
+
+The first 12 hex digits of the sha256 of `.git/index` and its modification time were recorded after each step:
+
+| Point                                  | Hash           | Modification time |
+| -------------------------------------- | -------------- | ----------------- |
+| After `touch`                          | `1bc306f8c624` | 23:44:49.999      |
+| After `git --no-optional-locks status` | `1bc306f8c624` | 23:44:49.999      |
+| After `git status`                     | `d297347e84dd` | 23:44:51.932      |
+
+Neither `status` printed anything, and nothing in the repository had changed, yet the run without `--no-optional-locks` rewrote the index file.
+
+## Investigation and cause
+
+### git status refreshes and writes back the index by default
+
+The index file, `.git/index`, caches the size, modification time, and other details of every tracked file, and git uses it to tell quickly whether a file has changed. When a file's content stays the same but its modification time changes, as happens with editor saves, formatters, `touch`, or sync tools, `git status` has to read the content again to confirm that nothing changed. Once confirmed, it writes the new modification time back to the index so the next run can skip the read.
+
+The BACKGROUND REFRESH section of the git documentation covers exactly this. Writing out the refreshed index is an optimization that the result of `status` does not depend on. When `status` runs in the background, the lock held during the write may conflict with other simultaneous processes and cause them to fail, so background scripts should consider `git --no-optional-locks status`.
+
+### Writing the index takes index.lock and collides with the author's git commands
+
+Before git writes the index, it creates `.git/index.lock` and replaces the original file when done. Another git command that needs to modify the index at that moment fails because the lock file already exists. An agent might run LeafPress's doctor while the author works, and the author might be running `git add` or `git commit` in the same repository, which is the situation the documentation describes.
+
+A test repository with 3000 files simulated it. A background loop ran "`touch` three files, then `git status`", while the foreground ran `git add` 150 times. Four of them failed:
+
+```text
+fatal: Unable to create '…/.git/index.lock': File exists.
+
+Another git process seems to be running in this repository, or the lock file may be stale
+```
+
+With the background loop switched to `git --no-optional-locks status`, all 150 `git add` runs succeeded. Each setup ran once, so the numbers only show that the collision is real; they are not a failure rate.
+
+## Solution
+
+At the time, every git command in LeafPress that read the blog repository's state went through one function, which added shared arguments:
+
+```ts
+/** Arguments added to every git command: --no-optional-locks keeps status and similar commands from writing .git/index (doctor changes nothing);
+ *  core.quotepath=false turns off octal escaping of paths so Chinese file names display as is */
+export const GIT_BASE_ARGS = [
+  "--no-optional-locks",
+  "-c",
+  "core.quotepath=false",
+] as const;
+
+const result = await exec("git", [...GIT_BASE_ARGS, ...args], {
+  cwd: repoPath,
+});
+```
+
+`--no-optional-locks` is equivalent to setting the environment variable `GIT_OPTIONAL_LOCKS=0`. git skips every optional operation that requires a lock, and `status` still computes its result without writing the index back. `core.quotepath=false` has nothing to do with locks: by default git escapes Chinese file names into octal sequences such as `"\346\250\241…"`, and turning it off prints the original names.
+
+The option only skips optional locking. Commands that must write to the repository, such as `git fetch` and `git commit`, still take their locks, and the option cannot make them read-only.
+
+## Verification results
+
+- In the reproduction above, the hash and modification time of the index file did not change across the `status` run with `--no-optional-locks`.
+- LeafPress had a test at the time that ran against a real git repository: it moved the modification time of `README.md` 10 minutes ahead, called the function that reads the repository state, and confirmed that the sha256 of `.git/index` was unchanged.
+- These results come from Git 2.55.0.windows.3 on Windows.
+
+LeafPress later moved its checks into its own git worktree and now only runs fetch and worktree registration against the author's repository, so the code that read the repository state and its test were removed.
+
+## References
+
+- [git-status documentation: BACKGROUND REFRESH](https://git-scm.com/docs/git-status#_background_refresh)
+- [git documentation: --no-optional-locks](https://git-scm.com/docs/git#Documentation/git.txt---no-optional-locks): equivalent to `GIT_OPTIONAL_LOCKS=0`
